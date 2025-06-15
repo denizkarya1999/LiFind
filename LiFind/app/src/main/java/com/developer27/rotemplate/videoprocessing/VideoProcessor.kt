@@ -50,7 +50,7 @@ object Settings {
     }
 
     object Inference {
-        var confidenceThreshold: Float = 0.5f
+        var confidenceThreshold: Float = 0.7f
         var iouThreshold: Float = 0.5f
     }
 
@@ -153,17 +153,10 @@ class VideoProcessor(private val context: Context) {
                 .also { tfliteInterpreter?.run(it.buffer, out) }
 
             // Parse result
-            YOLOHelper.parseTFLite(out)?.let { detection ->
-                // Convert from letterboxed coords back to original image coords
+            YOLOHelper.parseTFLite(out)?.let { det ->
                 val (box, _) = YOLOHelper.rescaleInferencedCoordinates(
-                    detection,
-                    bitmap.width,
-                    bitmap.height,
-                    offsets,
-                    inputW,
-                    inputH
+                    det, bitmap.width, bitmap.height, offsets, inputW, inputH
                 )
-                // Draw bounding box if enabled
                 if (Settings.BoundingBox.enableBoundingBox) {
                     YOLOHelper.drawBoundingBoxes(m, box)
                 }
@@ -290,78 +283,40 @@ object YOLOHelper {
      * Returns the single best detection after NMS, or null if none are above threshold.
      */
     fun parseTFLite(rawOutput: Array<Array<FloatArray>>): DetectionResult? {
-        // Usually [0] is the batch dimension
         val predictions = rawOutput[0]
-        val detections = mutableListOf<DetectionResult>()
 
         for (row in predictions) {
-            // row = [x, y, w, h, obj_conf, class1, class2, ... ]
             if (row.size < 6) continue
 
-            val xCenter = row[0]
-            val yCenter = row[1]
-            val width = row[2]
-            val height = row[3]
+            val xCenter    = row[0]
+            val yCenter    = row[1]
+            val width      = row[2]
+            val height     = row[3]
             val objectConf = row[4]
-
-            // class scores start from row[5..]
             val classScores = row.copyOfRange(5, row.size)
 
-            // SAFE approach: find best class index manually or using maxBy
-            val bestClassIdx = classScores.indices.maxByOrNull { classScores[it] } ?: -1
-            val bestClassScore = if (bestClassIdx >= 0) classScores[bestClassIdx] else 0f
-
-            // Combined confidence
-            val finalConf = objectConf * bestClassScore
+            // pick best class
+            val bestClassIdx   = classScores.indices.maxByOrNull { classScores[it] } ?: -1
+            val bestClassScore = classScores.getOrNull(bestClassIdx) ?: 0f
+            val finalConf      = objectConf * bestClassScore
 
             if (finalConf >= Settings.Inference.confidenceThreshold) {
-                detections.add(
-                    DetectionResult(
-                        xCenter,
-                        yCenter,
-                        width,
-                        height,
-                        finalConf,
-                        bestClassIdx
-                    )
+                // log the detection right here
+                Log.d("YOLOTest",
+                    "IMMEDIATE DETECTION ➔ " +
+                            "x=$xCenter, y=$yCenter, w=$width, h=$height, " +
+                            "conf=${"%.3f".format(finalConf)}, classId=$bestClassIdx"
+                )
+                return DetectionResult(
+                    xCenter, yCenter, width, height,
+                    finalConf, bestClassIdx
                 )
             }
         }
 
-        // If no detections above threshold, return null
-        if (detections.isEmpty()) {
-            Log.d("YOLOTest", "No detections above confidence threshold: ${Settings.Inference.confidenceThreshold}")
-            return null
-        }
-
-        // Sort by descending confidence
-        detections.sortByDescending { it.confidence }
-
-        // Convert them to bounding boxes for NMS
-        val detectionBoxes = detections.map { it to detectionToBox(it) }.toMutableList()
-        val nmsDetections = mutableListOf<DetectionResult>()
-
-        // Simple NMS
-        while (detectionBoxes.isNotEmpty()) {
-            val current = detectionBoxes.removeAt(0)
-            nmsDetections.add(current.first)
-
-            // Remove all boxes that overlap above the iou threshold
-            detectionBoxes.removeAll { other ->
-                computeIoU(current.second, other.second) > Settings.Inference.iouThreshold
-            }
-        }
-
-        // Return the best detection from final list
-        val bestDetection = nmsDetections.maxByOrNull { it.confidence }
-        bestDetection?.let { d ->
-            Log.d(
-                "YOLOTest",
-                "BEST DETECTION: conf=${"%.3f".format(d.confidence)}, classId=${d.classId}, " +
-                        "x=${d.xCenter}, y=${d.yCenter}, w=${d.width}, h=${d.height}"
-            )
-        }
-        return bestDetection
+        // nothing above threshold
+        Log.d("YOLOTest", "No detections above threshold")
+        return null
     }
 
     private fun detectionToBox(d: DetectionResult) = BoundingBox(
