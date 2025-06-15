@@ -281,7 +281,7 @@ object ContourDetection {
 object YOLOHelper {
 
     // If you have multiple classes, list them here in order:
-    private val classNames = arrayOf("LED1", "LED2", "LED3", "LED4")
+    private val classNames = arrayOf("1000", "1001", "1010")
 
     /**
      * For YOLO models that output shape [1, N, 9] or [1, N, (5+numClasses)],
