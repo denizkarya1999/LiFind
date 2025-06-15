@@ -50,8 +50,7 @@ object Settings {
     }
 
     object Inference {
-        var confidenceThreshold: Float = 0.7f
-        var iouThreshold: Float = 0.5f
+        var confidenceThreshold: Float = 0.9f
     }
 
     object BoundingBox {
@@ -153,14 +152,22 @@ class VideoProcessor(private val context: Context) {
                 .also { tfliteInterpreter?.run(it.buffer, out) }
 
             // Parse result
-            YOLOHelper.parseTFLite(out)?.let { det ->
-                val (box, _) = YOLOHelper.rescaleInferencedCoordinates(
-                    det, bitmap.width, bitmap.height, offsets, inputW, inputH
-                )
-                if (Settings.BoundingBox.enableBoundingBox) {
-                    YOLOHelper.drawBoundingBoxes(m, box)
+            YOLOHelper.parseTFLite(out)
+                ?.distinctBy { it.classId }   // if you still want only one per class
+                ?.take(3)                     // or whatever max count you want
+                ?.forEach { det ->
+                    // 1) Rescale each detection back to original coords
+                    val (box, _) = YOLOHelper.rescaleInferencedCoordinates(
+                        det,
+                        bitmap.width, bitmap.height,
+                        offsets, inputW, inputH
+                    )
+
+                    // 2) Draw box + label for each one
+                    if (Settings.BoundingBox.enableBoundingBox) {
+                        YOLOHelper.drawBoundingBoxes(m, box)
+                    }
                 }
-            }
         }
 
         // Convert annotated Mat back to a Bitmap
@@ -282,8 +289,9 @@ object YOLOHelper {
      *
      * Returns the single best detection after NMS, or null if none are above threshold.
      */
-    fun parseTFLite(rawOutput: Array<Array<FloatArray>>): DetectionResult? {
+    fun parseTFLite(rawOutput: Array<Array<FloatArray>>): List<DetectionResult>? {
         val predictions = rawOutput[0]
+        val detections = mutableListOf<DetectionResult>()
 
         for (row in predictions) {
             if (row.size < 6) continue
@@ -295,28 +303,29 @@ object YOLOHelper {
             val objectConf = row[4]
             val classScores = row.copyOfRange(5, row.size)
 
-            // pick best class
             val bestClassIdx   = classScores.indices.maxByOrNull { classScores[it] } ?: -1
             val bestClassScore = classScores.getOrNull(bestClassIdx) ?: 0f
             val finalConf      = objectConf * bestClassScore
 
             if (finalConf >= Settings.Inference.confidenceThreshold) {
-                // log the detection right here
                 Log.d("YOLOTest",
-                    "IMMEDIATE DETECTION ➔ " +
-                            "x=$xCenter, y=$yCenter, w=$width, h=$height, " +
+                    "DETECTED ➔ x=$xCenter, y=$yCenter, w=$width, h=$height, " +
                             "conf=${"%.3f".format(finalConf)}, classId=$bestClassIdx"
                 )
-                return DetectionResult(
+                detections += DetectionResult(
                     xCenter, yCenter, width, height,
                     finalConf, bestClassIdx
                 )
             }
         }
 
-        // nothing above threshold
-        Log.d("YOLOTest", "No detections above threshold")
-        return null
+        if (detections.isEmpty()) {
+            Log.d("YOLOTest", "No detections above threshold")
+            return null
+        }
+
+        // Return detections
+        return detections
     }
 
     private fun detectionToBox(d: DetectionResult) = BoundingBox(
