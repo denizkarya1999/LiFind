@@ -27,6 +27,7 @@ import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.camera.RecorderHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.videoprocessing.VideoProcessor
+import com.developer27.lifind.videoprocessing.YOLOHelper
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.nnapi.NnApiDelegate
@@ -179,6 +180,7 @@ class MainActivity : AppCompatActivity() {
 
         // Load ML models.
         loadTFLiteModelOnStartupThreaded("best-fp16.tflite")
+        loadTFLiteModelOnStartupThreaded("Distance_YOLOv8_float32.tflite")
 
         cameraHelper.setupZoomControls()
         sharedPreferences.registerOnSharedPreferenceChangeListener { _, key ->
@@ -257,7 +259,10 @@ class MainActivity : AppCompatActivity() {
                         }
                         when (modelName) {
                             "best-fp16.tflite" -> {
-                                videoProcessor?.setInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
+                                videoProcessor?.setYoloInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
+                            }
+                            "Distance_YOLOv8_float32.tflite" -> {
+                                videoProcessor?.setDistanceInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
                             }
                             else -> Log.d("MainActivity", "No model processing method defined for $modelName")
                         }
