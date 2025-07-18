@@ -2,7 +2,6 @@ package com.developer27.lifind.videoprocessing
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,7 +10,6 @@ import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
@@ -45,7 +43,7 @@ var distanceInterpreter: Interpreter? = null
 
 object Settings {
     object DetectionMode {
-        enum class Mode { CONTOUR, YOLO }
+        enum class Mode { YOLO }
         var current: Mode = Mode.YOLO
         var enableYOLOinference = true
     }
@@ -58,11 +56,6 @@ object Settings {
         var enableBoundingBox = true
         var boxColor = Scalar(0.0, 39.0, 76.0)
         var boxThickness = 2
-    }
-
-    object Brightness {
-        var factor = 2.0
-        var threshold = 150.0
     }
 }
 
@@ -95,7 +88,6 @@ class VideoProcessor(private val context: Context) {
         CoroutineScope(Dispatchers.Default).launch {
             val result: Pair<Bitmap, Bitmap>? = try {
                 when (Settings.DetectionMode.current) {
-                    Settings.DetectionMode.Mode.CONTOUR -> processFrameInternalCONTOUR(bitmap)
                     Settings.DetectionMode.Mode.YOLO -> processFrameInternalYOLO(bitmap)
                 }
             } catch (e: Exception) {
@@ -106,95 +98,104 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
-    private fun processFrameInternalCONTOUR(bitmap: Bitmap): Pair<Bitmap, Bitmap>? {
-        return try {
-            val (pMat, pBmp) = Preprocessing.preprocessFrame(bitmap)
-            val (_, cMat) = ContourDetection.processContourDetection(pMat)
-            val outBmp = Bitmap.createBitmap(cMat.cols(), cMat.rows(), Bitmap.Config.ARGB_8888)
-                .also { Utils.matToBitmap(cMat, it) }
-            pMat.release()
-            cMat.release()
-            outBmp to pBmp
-        } catch (e: Exception) {
-            Log.d("VideoProcessor","Error processing frame: ${e.message}", e)
-            null
-        }
-    }
-
+    /**
+     * Runs YOLO-based detection and distance estimation on the given bitmap.
+     * Returns a Pair of:
+     *  1) outBmp: the original image annotated with bounding boxes and labels
+     *  2) letterboxed: the resized/letterboxed version fed into the model
+     */
     private suspend fun processFrameInternalYOLO(
         bitmap: Bitmap
     ): Pair<Bitmap, Bitmap> = withContext(Dispatchers.IO) {
 
+        // Tag for logging
         val tag = javaClass.simpleName
 
+        // 1) Get expected model input size and output tensor shape
         val (inputW, inputH, outputShape) = getModelDimensions()
+
+        // 2) Resize and pad the input bitmap to match model input, preserving aspect ratio
         val (letterboxed, offsets) =
             YOLOHelper.createLetterboxedBitmap(bitmap, inputW, inputH)
+
+        // 3) Load the letterboxed bitmap into a TensorImage for inference
         val tensorImage = TensorImage(DataType.FLOAT32).apply { load(letterboxed) }
 
+        // 4) Prepare output buffer for distance estimation model
         val distTensorShape = distanceInterpreter
             ?.getOutputTensor(0)
             ?.shape()
             ?: intArrayOf(1, 1, YOLOHelper.numDistanceClasses)
-
+        // 2D array: [batch=1][numDistanceClasses]
         val distOut = Array(distTensorShape[1]) {
             FloatArray(distTensorShape[2])
         }
 
+        // 5) Convert original bitmap to OpenCV Mat to draw on later
         val m = Mat().also { Utils.bitmapToMat(bitmap, it) }
-        var bestDistanceLabel = "Unknown"
-        distanceInterpreter?.let { interp ->
-            val t0 = SystemClock.elapsedRealtimeNanos()
-            interp.run(tensorImage.buffer, arrayOf(distOut))
-            val ms = (SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000
-            Log.d(tag, "Distance inference time: ${ms} ms")
 
+        // Default label if distance model is unavailable or yields no valid result
+        var bestDistanceLabel = "Unknown"
+
+        // 6) Run distance estimation model (if set) to predict distance class
+        distanceInterpreter?.let { interp ->
             val scores = distOut[0]
 
-            // --- Sort indices by score descending ---
+            // Sort class indices by descending confidence
             val sortedScores = scores
                 .mapIndexed { idx, score -> idx to score }
                 .filter { it.first < YOLOHelper.numDistanceClasses }
                 .sortedByDescending { it.second }
 
-            // Log only the highest‐confidence class, if any
+            // Log the top distance class and its confidence
             sortedScores.firstOrNull()?.let { (idx, score) ->
                 val name = YOLOHelper.labelForDistanceIdx(idx)
                 Log.d(tag, "Top Distance[$name] = ${"%.2f".format(score * 100)}%")
             }
 
-            // Safely grab the best index, or -1 if the list is empty
+            // Choose the best index or -1 if none
             val bestIdx = sortedScores.firstOrNull()?.first ?: -1
             if (bestIdx >= 0) {
                 bestDistanceLabel = YOLOHelper.labelForDistanceIdx(bestIdx)
             }
         } ?: Log.w(tag, "Distance interpreter not initialised")
 
+        // 7) If YOLO inference is enabled and interpreter is available, run object detection
         if (Settings.DetectionMode.enableYOLOinference && yoloInterpreter != null) {
+            // Prepare output buffer for YOLO model: 3D array [1][grid][attributes]
             val yoloOut = Array(outputShape[0]) {
                 Array(outputShape[1]) { FloatArray(outputShape[2]) }
             }
+            // Run inference
             tensorImage.buffer.also { yoloInterpreter!!.run(it, yoloOut) }
 
+            // Parse raw output into detection results
             YOLOHelper.parseTFLite(yoloOut)
+                // Remove duplicate class detections
                 ?.distinctBy { it.classId }
+                // Limit to top 3 detections
                 ?.take(3)
                 ?.forEach { det ->
+                    // Convert normalized box coordinates back to original image scale
                     val (box, _) = YOLOHelper.rescaleInferencedCoordinates(
                         det, bitmap.width, bitmap.height, offsets, inputW, inputH
                     )
                     if (Settings.BoundingBox.enableBoundingBox) {
+                        // Build label combining class name, distance, and confidence
                         val yoloLabel = YOLOHelper.classNameForId(det.classId)
-                        val labelText = "$yoloLabel | $bestDistanceLabel (${("%.2f".format(det.confidence * 100))}%)"
+                        val labelText = "$yoloLabel | $bestDistanceLabel (${"%.2f".format(det.confidence * 100)}%)"
+                        // Draw bounding box and label on the Mat
                         YOLOHelper.drawBoundingBoxesWithCustomLabel(m, box, labelText)
                     }
                 }
         }
 
+        // 8) Convert annotated Mat back to Bitmap and release Mat
         val outBmp = Bitmap
             .createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
             .also { Utils.matToBitmap(m, it); m.release() }
 
+        // Return the annotated image and the model input image
         outBmp to letterboxed
     }
 
@@ -208,65 +209,6 @@ class VideoProcessor(private val context: Context) {
         val outShape = outTensor?.shape()?.toList() ?: listOf(1, 1, 9)
 
         return Triple(w, h, outShape)
-    }
-}
-
-object Preprocessing {
-    fun preprocessFrame(src: Bitmap): Pair<Mat, Bitmap> {
-        val sMat = Mat().also { Utils.bitmapToMat(src, it) }
-        val gMat = Mat().also {
-            Imgproc.cvtColor(sMat, it, Imgproc.COLOR_BGR2GRAY)
-            sMat.release()
-        }
-        val eMat = Mat().also {
-            Core.multiply(gMat, Scalar(Settings.Brightness.factor), it)
-            gMat.release()
-        }
-        val tMat = Mat().also {
-            Imgproc.threshold(
-                eMat,
-                it,
-                Settings.Brightness.threshold,
-                255.0,
-                Imgproc.THRESH_TOZERO
-            )
-            eMat.release()
-        }
-        val bMat = Mat().also {
-            Imgproc.GaussianBlur(tMat, it, Size(5.0, 5.0), 0.0)
-            tMat.release()
-        }
-        val k = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-        val cMat = Mat().also {
-            Imgproc.morphologyEx(bMat, it, Imgproc.MORPH_CLOSE, k)
-            bMat.release()
-        }
-        val bmp = Bitmap.createBitmap(cMat.cols(), cMat.rows(), Bitmap.Config.ARGB_8888).also {
-            Utils.matToBitmap(cMat, it)
-        }
-        return cMat to bmp
-    }
-}
-
-object ContourDetection {
-
-    fun processContourDetection(mat: Mat): Pair<Point?, Mat> {
-        val biggestContour = findContours(mat).maxByOrNull { Imgproc.contourArea(it) }
-        val center = biggestContour?.let {
-            Imgproc.drawContours(mat, listOf(it), -1, Settings.BoundingBox.boxColor, Settings.BoundingBox.boxThickness)
-            val m = Imgproc.moments(it)
-            Point(m.m10 / m.m00, m.m01 / m.m00)
-        }
-        Imgproc.cvtColor(mat, mat, Imgproc.COLOR_GRAY2BGR)
-        return center to mat
-    }
-
-    private fun findContours(mat: Mat): MutableList<MatOfPoint> {
-        val contours = mutableListOf<MatOfPoint>()
-        val hierarchy = Mat()
-        Imgproc.findContours(mat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-        hierarchy.release()
-        return contours
     }
 }
 
@@ -286,74 +228,111 @@ object YOLOHelper {
     fun classNameForId(classId: Int): String =
         if (classId in classNames.indices) classNames[classId] else "Unknown"
 
+    /**
+     * Parses raw TensorFlow Lite output into a list of DetectionResult,
+     * applying a confidence threshold and selecting the most likely class.
+     * @param rawOutput 3D array from YOLO model: [batch][rows][attributes]
+     * @return List of DetectionResult if any detections pass the threshold, otherwise null
+     */
     fun parseTFLite(rawOutput: Array<Array<FloatArray>>): List<DetectionResult>? {
+        // 1) Extract predictions for the first (and only) batch
         val predictions = rawOutput[0]
+        // 2) Prepare a list to collect valid detections
         val detections = mutableListOf<DetectionResult>()
+
+        // 3) Iterate over each prediction row
         for (row in predictions) {
+            // Skip rows that don't contain enough data (x,y,width,height,objectConf + at least one class score)
             if (row.size < 6) continue
-            val xCenter    = row[0]
-            val yCenter    = row[1]
-            val width      = row[2]
-            val height     = row[3]
-            val objectConf = row[4]
-            val classScores= row.copyOfRange(5, row.size)
+
+            // 4) Unpack raw values
+            val xCenter    = row[0]                   // normalized center X
+            val yCenter    = row[1]                   // normalized center Y
+            val width      = row[2]                   // normalized width
+            val height     = row[3]                   // normalized height
+            val objectConf = row[4]                   // objectness confidence
+
+            // 5) Remaining entries are class probabilities
+            val classScores = row.copyOfRange(5, row.size)
+
+            // 6) Determine the most likely class index and its score
             val bestClassIdx   = classScores.indices.maxByOrNull { classScores[it] } ?: -1
             val bestClassScore = classScores.getOrNull(bestClassIdx) ?: 0f
-            val finalConf      = objectConf * bestClassScore
+
+            // 7) Combine object confidence and class confidence
+            val finalConf = objectConf * bestClassScore
+
+            // 8) Only keep detections above the configured threshold
             if (finalConf >= Settings.Inference.confidenceThreshold) {
+                // 9) Create DetectionResult and add to list
                 detections += DetectionResult(
-                    xCenter, yCenter, width, height,
-                    finalConf, bestClassIdx
+                    xCenter,
+                    yCenter,
+                    width,
+                    height,
+                    finalConf,
+                    bestClassIdx
                 )
             }
         }
+
+        // 10) Return null if no detections passed threshold, otherwise the list
         return if (detections.isEmpty()) null else detections
     }
 
-    private fun detectionToBox(d: DetectionResult) = BoundingBox(
-        x1 = d.xCenter - d.width / 2,
-        y1 = d.yCenter - d.height / 2,
-        x2 = d.xCenter + d.width / 2,
-        y2 = d.yCenter + d.height / 2,
-        confidence = d.confidence,
-        classId = d.classId
-    )
 
+    /**
+     * Converts normalized detection coordinates from the model input space back to the original image space,
+     * accounting for padding (letterboxing) and scaling.
+     * Returns a Pair of:
+     *  1) boundingBox: the rectangle in original image coordinates
+     *  2) center: the center point of the bounding box
+     */
     fun rescaleInferencedCoordinates(
         detection: DetectionResult,
         originalWidth: Int,
         originalHeight: Int,
-        padOffsets: Pair<Int, Int>,
+        padOffsets: Pair<Int, Int>,       // (left, top) padding applied during letterboxing
         modelInputWidth: Int,
         modelInputHeight: Int
     ): Pair<BoundingBox, Point> {
+        // 1) Compute the scale factor between model input and original image
         val scale = min(
             modelInputWidth / originalWidth.toDouble(),
             modelInputHeight / originalHeight.toDouble()
         )
+
+        // 2) Extract the padding offsets applied on the left and top
         val padLeft = padOffsets.first.toDouble()
         val padTop = padOffsets.second.toDouble()
 
+        // 3) Convert normalized center and size back to letterboxed pixel values
         val xCenterLetterboxed = detection.xCenter * modelInputWidth
         val yCenterLetterboxed = detection.yCenter * modelInputHeight
         val boxWidthLetterboxed = detection.width * modelInputWidth
         val boxHeightLetterboxed = detection.height * modelInputHeight
 
+        // 4) Remove padding and apply inverse scaling to map back to original image
         val xCenterOriginal = (xCenterLetterboxed - padLeft) / scale
         val yCenterOriginal = (yCenterLetterboxed - padTop) / scale
         val boxWidthOriginal = boxWidthLetterboxed / scale
         val boxHeightOriginal = boxHeightLetterboxed / scale
 
+        // 5) Compute the top-left and bottom-right coordinates of the bounding box
         val x1Original = xCenterOriginal - (boxWidthOriginal / 2)
         val y1Original = yCenterOriginal - (boxHeightOriginal / 2)
         val x2Original = xCenterOriginal + (boxWidthOriginal / 2)
         val y2Original = yCenterOriginal + (boxHeightOriginal / 2)
 
-        Log.d("YOLOTest",
-            "Adjusted BOX: x1=${"%.2f".format(x1Original)}, y1=${"%.2f".format(y1Original)}, " +
-                    "x2=${"%.2f".format(x2Original)}, y2=${"%.2f".format(y2Original)}"
+        // 6) Log adjusted box coordinates for debugging
+        Log.d("YOLOHelper",
+            "Adjusted BOX: x1=${"%.2f".format(x1Original)}, " +
+                    "y1=${"%.2f".format(y1Original)}, " +
+                    "x2=${"%.2f".format(x2Original)}, " +
+                    "y2=${"%.2f".format(y2Original)}"
         )
 
+        // 7) Create a BoundingBox data object in original image space
         val boundingBox = BoundingBox(
             x1 = x1Original.toFloat(),
             y1 = y1Original.toFloat(),
@@ -362,13 +341,26 @@ object YOLOHelper {
             confidence = detection.confidence,
             classId = detection.classId
         )
+
+        // 8) Build a Point for the box center
         val center = Point(xCenterOriginal, yCenterOriginal)
+
+        // 9) Return the bounding box and its center point
         return Pair(boundingBox, center)
     }
 
+    /**
+     * Draws a bounding box with a filled label background and text on the given Mat image.
+     * @param mat       OpenCV Mat on which to draw
+     * @param box       BoundingBox containing coordinates and detection metadata
+     * @param labelText Text to display above the bounding box
+     */
     fun drawBoundingBoxesWithCustomLabel(mat: Mat, box: BoundingBox, labelText: String) {
+        // 1) Define the top-left and bottom-right corners of the rectangle
         val topLeft = Point(box.x1.toDouble(), box.y1.toDouble())
         val bottomRight = Point(box.x2.toDouble(), box.y2.toDouble())
+
+        // 2) Draw the rectangle for the bounding box
         Imgproc.rectangle(
             mat,
             topLeft,
@@ -376,19 +368,36 @@ object YOLOHelper {
             Settings.BoundingBox.boxColor,
             Settings.BoundingBox.boxThickness
         )
+
+        // 3) Prepare text properties: font scale and thickness
         val fontScale = 0.6
         val thickness = 1
         val baseline = IntArray(1)
-        val textSize = Imgproc.getTextSize(labelText, Imgproc.FONT_HERSHEY_SIMPLEX, fontScale, thickness, baseline)
+
+        // 4) Measure the size of the text to create a background box
+        val textSize = Imgproc.getTextSize(
+            labelText,
+            Imgproc.FONT_HERSHEY_SIMPLEX,
+            fontScale,
+            thickness,
+            baseline
+        )
+
+        // 5) Compute text origin so it sits just above the bounding box
         val textX = box.x1.toInt()
+        // Offset upward by 5 pixels; ensure Y is at least 10 to stay within image
         val textY = (box.y1 - 5).toInt().coerceAtLeast(10)
+
+        // 6) Draw a filled rectangle behind the text for better readability
         Imgproc.rectangle(
             mat,
-            Point(textX.toDouble(), textY.toDouble() + baseline[0]),
-            Point(textX + textSize.width, textY - textSize.height),
+            Point(textX.toDouble(), (textY + baseline[0]).toDouble()),
+            Point((textX + textSize.width).toDouble(), (textY - textSize.height).toDouble()),
             Settings.BoundingBox.boxColor,
             Imgproc.FILLED
         )
+
+        // 7) Render the label text itself in white
         Imgproc.putText(
             mat,
             labelText,
@@ -400,26 +409,49 @@ object YOLOHelper {
         )
     }
 
+    /**
+     * Resizes and pads the source bitmap to fit the target dimensions while maintaining aspect ratio.
+     * Returns a Pair of:
+     *  1) outputBitmap: the letterboxed image matching targetWidth x targetHeight
+     *  2) Pair(leftPadding, topPadding): the pixel offsets applied on the left and top
+     */
     fun createLetterboxedBitmap(
         srcBitmap: Bitmap,
         targetWidth: Int,
         targetHeight: Int,
-        padColor: Scalar = Scalar(0.0, 0.0, 0.0)
+        padColor: Scalar = Scalar(0.0, 0.0, 0.0)   // Color used for padding areas
     ): Pair<Bitmap, Pair<Int, Int>> {
+        // 1) Convert source bitmap to OpenCV Mat for processing
         val srcMat = Mat().also { Utils.bitmapToMat(srcBitmap, it) }
-        val (srcWidth, srcHeight) = (srcMat.cols().toDouble()) to (srcMat.rows().toDouble())
-        val scale = min(targetWidth / srcWidth, targetHeight / srcHeight)
+
+        // 2) Get original dimensions
+        val (srcWidth, srcHeight) = srcMat.cols().toDouble() to srcMat.rows().toDouble()
+
+        // 3) Compute uniform scale factor to fit the target size
+        val scale = min(
+            targetWidth / srcWidth,
+            targetHeight / srcHeight
+        )
+
+        // 4) Determine new dimensions after scaling
         val newWidth = (srcWidth * scale).toInt()
         val newHeight = (srcHeight * scale).toInt()
+
+        // 5) Resize image to new dimensions
         val resized = Mat().also {
             Imgproc.resize(srcMat, it, Size(newWidth.toDouble(), newHeight.toDouble()))
-            srcMat.release()
+            srcMat.release()  // Free original Mat
         }
+
+        // 6) Calculate padding needed to reach target dimensions
         val padWidth = targetWidth - newWidth
         val padHeight = targetHeight - newHeight
+        // Split padding evenly on both sides
         val computePadding = { total: Int -> total / 2 to (total - total / 2) }
         val (top, bottom) = computePadding(padHeight)
         val (left, right) = computePadding(padWidth)
+
+        // 7) Apply border padding (letterbox) around the resized image
         val letterboxed = Mat().also {
             Core.copyMakeBorder(
                 resized, it,
@@ -428,12 +460,20 @@ object YOLOHelper {
                 Core.BORDER_CONSTANT,
                 padColor
             )
-            resized.release()
+            resized.release()  // Free resized Mat
         }
-        val outputBitmap = Bitmap.createBitmap(letterboxed.cols(), letterboxed.rows(), srcBitmap.config).apply {
+
+        // 8) Convert the letterboxed Mat back to a Bitmap
+        val outputBitmap = Bitmap.createBitmap(
+            letterboxed.cols(),
+            letterboxed.rows(),
+            srcBitmap.config
+        ).apply {
             Utils.matToBitmap(letterboxed, this)
-            letterboxed.release()
+            letterboxed.release()  // Free letterboxed Mat
         }
+
+        // 9) Return the new bitmap and the padding offsets for later use
         return Pair(outputBitmap, Pair(left, top))
     }
 }

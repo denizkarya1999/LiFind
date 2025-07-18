@@ -1,4 +1,4 @@
-package com.developer27.rotemplate.routism
+package com.developer27.lifind.routism
 
 import org.junit.Test
 

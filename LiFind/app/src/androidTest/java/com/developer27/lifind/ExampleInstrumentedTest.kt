@@ -1,4 +1,4 @@
-package com.developer27.rotemplate.routism
+package com.developer27.lifind.routism
 
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
