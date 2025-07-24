@@ -18,7 +18,6 @@ import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.image.TensorImage
 import kotlin.math.min
-import kotlin.math.sqrt
 import kotlin.random.Random
 
 data class DetectionResult(
@@ -172,10 +171,6 @@ class VideoProcessor(private val context: Context) {
             // Run inference
             tensorImage.buffer.also { yoloInterpreter!!.run(it, yoloOut) }
 
-
-            // 1) Create a list to collect the detection centers
-            val centers = mutableListOf<Point>()
-
             // Parse raw output into detection results
             YOLOHelper.parseTFLite(yoloOut)
 
@@ -188,7 +183,6 @@ class VideoProcessor(private val context: Context) {
                     val (box, center) = YOLOHelper.rescaleInferencedCoordinates(
                         det, bitmap.width, bitmap.height, offsets, inputW, inputH
                     )
-                    centers += center  // <-- add center here
                     if (Settings.BoundingBox.enableBoundingBox) {
                         // Build label combining class name, distance, and confidence
                         val yoloLabel = YOLOHelper.classNameForId(det.classId)
@@ -198,9 +192,6 @@ class VideoProcessor(private val context: Context) {
                         YOLOHelper.drawDetectionCircleWithLabel(m, center, box, labelText)
                     }
                 }
-
-            // draw distances between circles
-            YOLOHelper.drawDistancesBetweenCircles(m, centers)
         }
 
         // draw three random circles each frame (This is a temproary code)
@@ -225,9 +216,6 @@ class VideoProcessor(private val context: Context) {
             // draw it
             YOLOHelper.drawDetectionCircleWithLabel(m, center, box, "Hardcoded")
         }
-
-        //Draw distances between those circles
-        YOLOHelper.drawDistancesBetweenCircles(m, centers)
 
         // 8) Convert annotated Mat back to Bitmap and release Mat
         val outBmp = Bitmap
@@ -454,63 +442,6 @@ object YOLOHelper {
             Scalar(0.0, 0.0, 0.0),
             thickness
         )
-    }
-
-    /**
-     * Draws dashed lines between each pair of `centers`, and annotates the pixel distance at the midpoint.
-     * @param mat         OpenCV Mat to draw on
-     * @param centers     List of circle centers (in image coords)
-     * @param color       Color of dashes and text
-     * @param thickness   Stroke thickness
-     * @param dashLength  Length in pixels of each dash segment
-     */
-    fun drawDistancesBetweenCircles(
-        mat: Mat,
-        centers: List<Point>,
-        color: Scalar = Settings.BoundingBox.boxColor,
-        thickness: Int = 2,
-        dashLength: Int = 10
-    ) {
-        for (i in 0 until centers.size) {
-            for (j in i + 1 until centers.size) {
-                val p1 = centers[i]
-                val p2 = centers[j]
-
-                // 1) compute vector and total distance
-                val dx   = p2.x - p1.x
-                val dy   = p2.y - p1.y
-                val dist = sqrt(dx*dx + dy*dy)
-
-                // 2) draw dashed line
-                if (dist > 0) {
-                    val segments = (dist / dashLength).toInt()
-                    val vx = dx / dist
-                    val vy = dy / dist
-
-                    for (k in 0 until segments step 2) {
-                        val start = Point(p1.x + vx * k * dashLength,
-                            p1.y + vy * k * dashLength)
-                        val endSeg = (k + 1).coerceAtMost(segments)
-                        val end    = Point(p1.x + vx * endSeg * dashLength,
-                            p1.y + vy * endSeg * dashLength)
-                        Imgproc.line(mat, start, end, color, thickness)
-                    }
-                }
-
-                // 3) annotate distance in pixels at midpoint
-                val mx = (p1.x + p2.x) / 2
-                val my = (p1.y + p2.y) / 2
-                Imgproc.putText(
-                    mat,
-                    "${dist.toInt()} px",
-                    Point(mx, my),
-                    Imgproc.FONT_HERSHEY_SIMPLEX,
-                    2.0,
-                    color,
-                    thickness
-                )
-            }
-        }
     }
 
     /**
