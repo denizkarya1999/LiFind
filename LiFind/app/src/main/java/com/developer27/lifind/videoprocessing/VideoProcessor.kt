@@ -2,6 +2,7 @@ package com.developer27.lifind.videoprocessing
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -17,7 +18,10 @@ import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.image.TensorImage
+import java.io.File
+import java.io.FileWriter
 import kotlin.math.min
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 data class DetectionResult(
@@ -161,7 +165,10 @@ class VideoProcessor(private val context: Context) {
             }
         } ?: Log.w(tag, "Distance interpreter not initialised")
 
-        // 7) If YOLO inference is enabled and interpreter is available, run object detection
+// 1) Create a mutable list to hold (center, radius) for *all* circles we draw
+        val circles = mutableListOf<Pair<Point, Double>>()
+
+// 7) If YOLO inference is enabled and interpreter is available, run object detection
         if (Settings.DetectionMode.enableYOLOinference && yoloInterpreter != null) {
             // Prepare output buffer for YOLO model: 3D array [1][grid][attributes]
             val yoloOut = Array(outputShape[0]) {
@@ -173,7 +180,6 @@ class VideoProcessor(private val context: Context) {
 
             // Parse raw output into detection results
             YOLOHelper.parseTFLite(yoloOut)
-
                 // Remove duplicate class detections
                 ?.distinctBy { it.classId }
                 // Limit to top 3 detections
@@ -183,39 +189,66 @@ class VideoProcessor(private val context: Context) {
                     val (box, center) = YOLOHelper.rescaleInferencedCoordinates(
                         det, bitmap.width, bitmap.height, offsets, inputW, inputH
                     )
+
                     if (Settings.BoundingBox.enableBoundingBox) {
                         // Build label combining class name, distance, and confidence
                         val yoloLabel = YOLOHelper.classNameForId(det.classId)
                         val labelText =
                             "$yoloLabel | $bestDistanceLabel (${"%.2f".format(det.confidence * 100)}%)"
-                        // Draw bounding box and label on the Mat
+
+                        // Draw bounding circle and label on the Mat
                         YOLOHelper.drawDetectionCircleWithLabel(m, center, box, labelText)
+
+                        // Compute exactly the same radius used internally:
+                        val boxW = (box.x2 - box.x1).toDouble()
+                        val boxH = (box.y2 - box.y1).toDouble()
+                        val baseRadius = (min(boxW, boxH) / 2.0)
+                        val yoloRadius = baseRadius * 3.5  // matches drawDetectionCircleWithLabel
+
+                        // Remember it for intersection drawing
+                        circles += center to yoloRadius
+
+                        // Log all intersections into a txt file
+                        CircleIntersectionHelper.logIntersections(context, circles)
+
+                        // now mark all intersections in a bold‐enough way
+                        CircleIntersectionHelper.drawIntersections(m, circles, markerRadius = 5)
                     }
                 }
         }
 
-        // draw three random circles each frame (This is a temproary code)
-        val centers = mutableListOf<Point>()
-        repeat(3) {
-            // pick a random center within the image
-            val x = Random.nextDouble(0.0, bitmap.width.toDouble())
-            val y = Random.nextDouble(0.0, bitmap.height.toDouble())
-            val center = Point(x, y)
-            centers += center
+        // ── Random circles, fully inside the image ────────────────────────────────
+        val baseRadius = 50.0                   // this is what drawDetectionCircleWithLabel uses as its “half‑box”
+        val drawRadius = baseRadius * 3.5       // that helper multiplies baseRadius by 3.5
 
-            // build a box around it (100×100 px)
+        repeat(3) {
+            // pick a center at least `drawRadius` px away from every border
+            val x = Random.nextDouble(drawRadius, bitmap.width - drawRadius)
+            val y = Random.nextDouble(drawRadius, bitmap.height - drawRadius)
+            val center = Point(x, y)
+
+            // build a 100×100 box so baseRadius = 50
             val box = BoundingBox(
-                x1 = (x - 50).toFloat(),
-                y1 = (y - 50).toFloat(),
-                x2 = (x + 50).toFloat(),
-                y2 = (y + 50).toFloat(),
+                x1 = (x - baseRadius).toFloat(),
+                y1 = (y - baseRadius).toFloat(),
+                x2 = (x + baseRadius).toFloat(),
+                y2 = (y + baseRadius).toFloat(),
                 confidence = 1.0f,
-                classId = 0
+                classId    = 0
             )
 
-            // draw it
+            // draw it with your existing helper
             YOLOHelper.drawDetectionCircleWithLabel(m, center, box, "Hardcoded")
+
+            // remember the exact radius the helper used
+            circles += center to drawRadius
+
+            // Log all intersections into a txt file
+            CircleIntersectionHelper.logIntersections(context, circles)
         }
+
+        // now mark all intersections in a bold‐enough way
+        CircleIntersectionHelper.drawIntersections(m, circles, markerRadius = 5)
 
         // 8) Convert annotated Mat back to Bitmap and release Mat
         val outBmp = Bitmap
@@ -510,5 +543,118 @@ object YOLOHelper {
 
         // 9) Return the new bitmap and the padding offsets for later use
         return Pair(outputBitmap, Pair(left, top))
+    }
+}
+
+object CircleIntersectionHelper {
+    // Keep a running set of all intersection points for the app's lifetime
+    private val allIntersections = mutableSetOf<Point>()
+    // Track how many times we've logged intersections
+    private var logIterationCount = 0
+
+    /**
+     * Returns up to two intersection points between two circles.
+     */
+    fun intersectCircles(c1: Point, r1: Double, c2: Point, r2: Double): List<Point> {
+        val dx = c2.x - c1.x
+        val dy = c2.y - c1.y
+        val d  = sqrt(dx*dx + dy*dy)
+        if (d > r1 + r2 || d < kotlin.math.abs(r1 - r2) || (d == 0.0 && r1 == r2)) {
+            return emptyList()
+        }
+        val a  = (r1*r1 - r2*r2 + d*d) / (2*d)
+        val h  = sqrt(r1*r1 - a*a)
+        val xm = c1.x + a * dx/d
+        val ym = c1.y + a * dy/d
+        val rx = -dy * (h/d)
+        val ry =  dx * (h/d)
+        val p1 = Point(xm + rx, ym + ry)
+        val p2 = Point(xm - rx, ym - ry)
+        return if (h == 0.0) listOf(p1) else listOf(p1, p2)
+    }
+
+    /**
+     * Draws a red dot + one (x,y) label at the first intersection point
+     * of every pair of circles in `circles`, and records each point.
+     */
+    fun drawIntersections(
+        mat: Mat,
+        circles: List<Pair<Point, Double>>,
+        markerRadius: Int = 5
+    ) {
+        for (i in 0 until circles.size) {
+            for (j in i + 1 until circles.size) {
+                val (c1, r1) = circles[i]
+                val (c2, r2) = circles[j]
+                val pts = intersectCircles(c1, r1, c2, r2)
+                if (pts.isNotEmpty()) {
+                    val p = pts[0]
+                    // record for lifetime
+                    allIntersections += p
+                    // draw the red dot
+                    Imgproc.circle(mat, p, markerRadius, Scalar(0.0, 0.0, 255.0), Imgproc.FILLED)
+                    // draw "(x,y)" just beside it
+                    val coordText = String.format("(%.1f, %.1f)", p.x, p.y)
+                    Imgproc.putText(
+                        mat, coordText,
+                        Point(p.x + markerRadius * 1.2, p.y - markerRadius * 1.2),
+                        Imgproc.FONT_HERSHEY_SIMPLEX,
+                        markerRadius / 5.0,
+                        Scalar(255.0, 255.0, 255.0),
+                        2
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns all intersection points recorded so far.
+     */
+    fun getAllIntersections(): List<Point> = allIntersections.toList()
+
+    /**
+     * Logs every first intersection point of each circle-pair into a text file
+     * in the Android public Documents directory, including an iteration number.
+     */
+    fun logIntersections(
+        context: Context,
+        circles: List<Pair<Point, Double>>,
+        fileName: String = "LiFind_Intersections_List.txt"
+    ) {
+        // increment iteration count
+        logIterationCount++
+
+        // collect this frame's intersections
+        val intersections = mutableListOf<Point>()
+        for (i in 0 until circles.size) {
+            for (j in i + 1 until circles.size) {
+                val (c1, r1) = circles[i]
+                val (c2, r2) = circles[j]
+                intersectCircles(c1, r1, c2, r2).firstOrNull()?.let { intersections += it }
+            }
+        }
+        if (intersections.isEmpty()) return
+
+        // Use Android's public Documents directory
+        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        if (docsDir == null || (!docsDir.exists() && !docsDir.mkdirs())) {
+            Log.e("CircleIntersectionHelper", "Failed to access Documents directory")
+            return
+        }
+        val outFile = File(docsDir, fileName)
+        FileWriter(outFile, /* append = */ true).use { writer ->
+            // write iteration header
+            writer.write("--- Iteration $logIterationCount ---\n")
+            // write each point
+            intersections.forEach { p ->
+                writer.write(String.format("%.1f, %.1f%n", p.x, p.y))
+            }
+            writer.write("\n")
+        }
+        Log.d(
+            "CircleIntersectionHelper",
+            "Appended ${intersections.size} intersections for iteration $logIterationCount to ${outFile.absolutePath}"
+        )
     }
 }
