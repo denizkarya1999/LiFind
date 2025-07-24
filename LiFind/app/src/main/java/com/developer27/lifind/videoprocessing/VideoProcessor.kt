@@ -18,6 +18,8 @@ import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.image.TensorImage
 import kotlin.math.min
+import kotlin.math.sqrt
+import kotlin.random.Random
 
 data class DetectionResult(
     val xCenter: Float,
@@ -49,12 +51,12 @@ object Settings {
     }
 
     object Inference {
-        var confidenceThreshold: Float = 0.5f
+        var confidenceThreshold: Float = 0f
     }
 
     object BoundingBox {
         var enableBoundingBox = true
-        var boxColor = Scalar(0.0, 39.0, 76.0)
+        var boxColor = Scalar(255.0, 255.0, 255.0)
         var boxThickness = 2
     }
 }
@@ -170,6 +172,10 @@ class VideoProcessor(private val context: Context) {
             // Run inference
             tensorImage.buffer.also { yoloInterpreter!!.run(it, yoloOut) }
 
+
+            // 1) Create a list to collect the detection centers
+            val centers = mutableListOf<Point>()
+
             // Parse raw output into detection results
             YOLOHelper.parseTFLite(yoloOut)
 
@@ -179,18 +185,49 @@ class VideoProcessor(private val context: Context) {
                 ?.take(3)
                 ?.forEach { det ->
                     // Convert normalized box coordinates back to original image scale
-                    val (box, _) = YOLOHelper.rescaleInferencedCoordinates(
+                    val (box, center) = YOLOHelper.rescaleInferencedCoordinates(
                         det, bitmap.width, bitmap.height, offsets, inputW, inputH
                     )
+                    centers += center  // <-- add center here
                     if (Settings.BoundingBox.enableBoundingBox) {
                         // Build label combining class name, distance, and confidence
                         val yoloLabel = YOLOHelper.classNameForId(det.classId)
-                        val labelText = "$yoloLabel | $bestDistanceLabel (${"%.2f".format(det.confidence * 100)}%)"
+                        val labelText =
+                            "$yoloLabel | $bestDistanceLabel (${"%.2f".format(det.confidence * 100)}%)"
                         // Draw bounding box and label on the Mat
-                        YOLOHelper.drawBoundingBoxesWithCustomLabel(m, box, labelText)
+                        YOLOHelper.drawDetectionCircleWithLabel(m, center, box, labelText)
                     }
                 }
+
+            // draw distances between circles
+            YOLOHelper.drawDistancesBetweenCircles(m, centers)
         }
+
+        // draw three random circles each frame (This is a temproary code)
+        val centers = mutableListOf<Point>()
+        repeat(3) {
+            // pick a random center within the image
+            val x = Random.nextDouble(0.0, bitmap.width.toDouble())
+            val y = Random.nextDouble(0.0, bitmap.height.toDouble())
+            val center = Point(x, y)
+            centers += center
+
+            // build a box around it (100×100 px)
+            val box = BoundingBox(
+                x1 = (x - 50).toFloat(),
+                y1 = (y - 50).toFloat(),
+                x2 = (x + 50).toFloat(),
+                y2 = (y + 50).toFloat(),
+                confidence = 1.0f,
+                classId = 0
+            )
+
+            // draw it
+            YOLOHelper.drawDetectionCircleWithLabel(m, center, box, "Hardcoded")
+        }
+
+        //Draw distances between those circles
+        YOLOHelper.drawDistancesBetweenCircles(m, centers)
 
         // 8) Convert annotated Mat back to Bitmap and release Mat
         val outBmp = Bitmap
@@ -352,31 +389,39 @@ object YOLOHelper {
     }
 
     /**
-     * Draws a bounding box with a filled label background and text on the given Mat image.
-     * @param mat       OpenCV Mat on which to draw
-     * @param box       BoundingBox containing coordinates and detection metadata
-     * @param labelText Text to display above the bounding box
+     * Draws a detection circle with a filled label background and text on the given Mat.
+     * @param mat        the OpenCV Mat to draw on
+     * @param center     the Point at which to center the circle
+     * @param box        the original bounding box (used to size the circle)
+     * @param labelText  the text to render above the circle
      */
-    fun drawBoundingBoxesWithCustomLabel(mat: Mat, box: BoundingBox, labelText: String) {
-        // 1) Define the top-left and bottom-right corners of the rectangle
-        val topLeft = Point(box.x1.toDouble(), box.y1.toDouble())
-        val bottomRight = Point(box.x2.toDouble(), box.y2.toDouble())
+    fun drawDetectionCircleWithLabel(
+        mat: Mat,
+        center: Point,
+        box: BoundingBox,
+        labelText: String
+    ) {
+        // 1) compute radius as half the smaller of box width/height
+        val boxWidth  = box.x2 - box.x1
+        val boxHeight = box.y2 - box.y1
+        val baseRadius = (min(boxWidth, boxHeight) / 2).toInt()
+        val radius = (baseRadius * 3.5f).toInt()
 
-        // 2) Draw the rectangle for the bounding box
-        Imgproc.rectangle(
+        // 2) draw the circle
+        Imgproc.circle(
             mat,
-            topLeft,
-            bottomRight,
+            center,
+            radius,
             Settings.BoundingBox.boxColor,
             Settings.BoundingBox.boxThickness
         )
 
-        // 3) Prepare text properties: font scale and thickness
-        val fontScale = 0.6
-        val thickness = 1
-        val baseline = IntArray(1)
+        // 3) prepare text properties
+        val fontScale = 2.0
+        val thickness = 2
+        val baseline  = IntArray(1)
 
-        // 4) Measure the size of the text to create a background box
+        // 4) measure text size
         val textSize = Imgproc.getTextSize(
             labelText,
             Imgproc.FONT_HERSHEY_SIMPLEX,
@@ -385,12 +430,12 @@ object YOLOHelper {
             baseline
         )
 
-        // 5) Compute text origin so it sits just above the bounding box
-        val textX = box.x1.toInt()
-        // Offset upward by 5 pixels; ensure Y is at least 10 to stay within image
-        val textY = (box.y1 - 5).toInt().coerceAtLeast(10)
+        // 5) position text centered above the circle
+        val textX = (center.x - textSize.width / 2).toInt().coerceAtLeast(0)
+        val textY = (center.y - radius - 5).toInt()
+            .coerceAtLeast((textSize.height + baseline[0]).toInt())
 
-        // 6) Draw a filled rectangle behind the text for better readability
+        // 6) draw filled background behind text
         Imgproc.rectangle(
             mat,
             Point(textX.toDouble(), (textY + baseline[0]).toDouble()),
@@ -399,16 +444,73 @@ object YOLOHelper {
             Imgproc.FILLED
         )
 
-        // 7) Render the label text itself in white
+        // 7) render the label text in white
         Imgproc.putText(
             mat,
             labelText,
             Point(textX.toDouble(), textY.toDouble()),
             Imgproc.FONT_HERSHEY_SIMPLEX,
             fontScale,
-            Scalar(255.0, 255.0, 255.0),
+            Scalar(0.0, 0.0, 0.0),
             thickness
         )
+    }
+
+    /**
+     * Draws dashed lines between each pair of `centers`, and annotates the pixel distance at the midpoint.
+     * @param mat         OpenCV Mat to draw on
+     * @param centers     List of circle centers (in image coords)
+     * @param color       Color of dashes and text
+     * @param thickness   Stroke thickness
+     * @param dashLength  Length in pixels of each dash segment
+     */
+    fun drawDistancesBetweenCircles(
+        mat: Mat,
+        centers: List<Point>,
+        color: Scalar = Settings.BoundingBox.boxColor,
+        thickness: Int = 2,
+        dashLength: Int = 10
+    ) {
+        for (i in 0 until centers.size) {
+            for (j in i + 1 until centers.size) {
+                val p1 = centers[i]
+                val p2 = centers[j]
+
+                // 1) compute vector and total distance
+                val dx   = p2.x - p1.x
+                val dy   = p2.y - p1.y
+                val dist = sqrt(dx*dx + dy*dy)
+
+                // 2) draw dashed line
+                if (dist > 0) {
+                    val segments = (dist / dashLength).toInt()
+                    val vx = dx / dist
+                    val vy = dy / dist
+
+                    for (k in 0 until segments step 2) {
+                        val start = Point(p1.x + vx * k * dashLength,
+                            p1.y + vy * k * dashLength)
+                        val endSeg = (k + 1).coerceAtMost(segments)
+                        val end    = Point(p1.x + vx * endSeg * dashLength,
+                            p1.y + vy * endSeg * dashLength)
+                        Imgproc.line(mat, start, end, color, thickness)
+                    }
+                }
+
+                // 3) annotate distance in pixels at midpoint
+                val mx = (p1.x + p2.x) / 2
+                val my = (p1.y + p2.y) / 2
+                Imgproc.putText(
+                    mat,
+                    "${dist.toInt()} px",
+                    Point(mx, my),
+                    Imgproc.FONT_HERSHEY_SIMPLEX,
+                    2.0,
+                    color,
+                    thickness
+                )
+            }
+        }
     }
 
     /**
