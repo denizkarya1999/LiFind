@@ -22,7 +22,6 @@ import java.io.File
 import java.io.FileWriter
 import kotlin.math.min
 import kotlin.math.sqrt
-import kotlin.random.Random
 
 data class DetectionResult(
     val xCenter: Float,
@@ -217,6 +216,7 @@ class VideoProcessor(private val context: Context) {
                 }
         }
 
+        /*
         // ── Random circles, fully inside the image ────────────────────────────────
         val baseRadius = 50.0                   // this is what drawDetectionCircleWithLabel uses as its “half‑box”
         val drawRadius = baseRadius * 3.5       // that helper multiplies baseRadius by 3.5
@@ -246,6 +246,7 @@ class VideoProcessor(private val context: Context) {
             // Log all intersections into a txt file
             CircleIntersectionHelper.logIntersections(context, circles)
         }
+        */
 
         // now mark all intersections in a bold‐enough way
         CircleIntersectionHelper.drawIntersections(m, circles, markerRadius = 5)
