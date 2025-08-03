@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
 import android.net.Uri
@@ -23,18 +25,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.camera.RecorderHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.videoprocessing.VideoProcessor
-import com.developer27.lifind.videoprocessing.YOLOHelper
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.GpuDelegate
-import org.tensorflow.lite.nnapi.NnApiDelegate
+import com.developer27.lifind.trilateration.Trilateration
+
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
+import org.tensorflow.lite.nnapi.NnApiDelegate
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -43,11 +47,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraHelper: CameraHelper
     private var videoProcessor: VideoProcessor? = null
 
-    // RecorderHelper instance and flag to track recording state.
     private lateinit var recorderHelper: RecorderHelper
     private var isRecordingVideo = false
-
-    // Flags for tracking and frame processing.
     private var isRecording = false
     private var isProcessing = false
     private var isProcessingFrame = false
@@ -56,7 +57,12 @@ class MainActivity : AppCompatActivity() {
         Manifest.permission.CAMERA,
         Manifest.permission.RECORD_AUDIO
     )
+
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
+    private lateinit var pickMediaLauncher: ActivityResultLauncher<String>
+
+    /** Stores last detected trilateration result for manual map display */
+    private var lastUserPosition: Pair<Double, Double>? = null
 
     companion object {
         private const val SETTINGS_REQUEST_CODE = 1
@@ -80,38 +86,27 @@ class MainActivity : AppCompatActivity() {
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
         override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = false
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-            if (isProcessing) {
-                processFrameWithVideoProcessor()
-            }
+            if (isProcessing) processFrameWithVideoProcessor()
         }
     }
 
     @SuppressLint("MissingPermission")
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Prevent screen from turning off
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        // Lock screen orientation to portrait
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-        // Install the splash screen (Android 12+)
         installSplashScreen()
-
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(viewBinding.root)
 
         sharedPreferences = PreferenceManager.getDefaultSharedPreferences(this)
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
-
         cameraHelper = CameraHelper(this, viewBinding, sharedPreferences)
         videoProcessor = VideoProcessor(this)
-
-        // Initialize RecorderHelper for raw video recording.
         recorderHelper = RecorderHelper(this, cameraHelper, sharedPreferences, viewBinding)
 
-        // Hide the processed frame view initially.
         viewBinding.processedFrameView.visibility = View.GONE
 
-        // Open the URL when the title container is clicked.
         viewBinding.titleContainer.setOnClickListener {
             val url = "https://www.zhangxiao.me/"
             val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
@@ -143,7 +138,6 @@ class MainActivity : AppCompatActivity() {
             requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
         }
 
-        // Set up the Start Tracking button.
         viewBinding.startProcessingButton.setOnClickListener {
             if (isRecording) {
                 stopProcessingAndRecording()
@@ -151,8 +145,6 @@ class MainActivity : AppCompatActivity() {
                 startProcessingAndRecording()
             }
         }
-
-        // Set up the Capture Video button to trigger recording functions.
         viewBinding.startRecordingButton.setOnClickListener {
             if (isRecordingVideo) {
                 recorderHelper.stopRecordingVideo()
@@ -168,8 +160,6 @@ class MainActivity : AppCompatActivity() {
                     ContextCompat.getColorStateList(this, R.color.red)
             }
         }
-
-        // Set up the Switch Camera, About, and Settings buttons.
         viewBinding.switchCameraButton.setOnClickListener { switchCamera() }
         viewBinding.aboutButton.setOnClickListener {
             startActivity(Intent(this, AboutXameraActivity::class.java))
@@ -178,7 +168,6 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        // Load ML models.
         loadTFLiteModelOnStartupThreaded("best-fp16.tflite")
         loadTFLiteModelOnStartupThreaded("Distance_YOLOv8_float32.tflite")
 
@@ -187,6 +176,65 @@ class MainActivity : AppCompatActivity() {
             if (key == "shutter_speed") {
                 cameraHelper.updateShutterSpeed()
             }
+        }
+
+        // --- UPLOAD BUTTON LOGIC ---
+        pickMediaLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            uri?.let { handlePickedMedia(it) }
+        }
+        viewBinding.uploadButton.setOnClickListener {
+            pickMediaLauncher.launch("*/*")
+        }
+
+        // --- VIEW MAP BUTTON LOGIC ---
+        viewBinding.viewMapButton.setOnClickListener {
+            Log.d("MainActivity", "View Map clicked") // For debugging -- see logcat!
+            val intent = Intent(this, MapActivity::class.java)
+            val userX = lastUserPosition?.first ?: 0.0
+            val userY = lastUserPosition?.second ?: 0.0
+            intent.putExtra("userX", userX)
+            intent.putExtra("userY", userY)
+            startActivity(intent)
+        }
+    }
+
+    // Handle picked image/video
+    private fun handlePickedMedia(uri: Uri) {
+        val mimeType = contentResolver.getType(uri)
+        if (mimeType?.startsWith("image") == true) {
+            val inputStream = contentResolver.openInputStream(uri)
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream?.close()
+            videoProcessor?.processFrame(bitmap) { processedFrames ->
+                processedFrames?.let { (outputBitmap, _) ->
+                    viewBinding.processedFrameView.setImageBitmap(outputBitmap)
+                    viewBinding.processedFrameView.visibility = View.VISIBLE
+
+                    // Extract your detections (classId, distance) from videoProcessor
+                    val detections: List<Pair<Int, Double>> = videoProcessor?.getLastLedDistances() ?: emptyList()
+                    val DA = detections.getOrNull(0)?.second ?: 0.0
+                    val DB = detections.getOrNull(1)?.second ?: 0.0
+                    val DC = detections.getOrNull(2)?.second ?: 0.0
+
+                    if (DA > 0 && DB > 0 && DC > 0) {
+                        val (x, y) = Trilateration.solve(DA, DB, DC)
+                        lastUserPosition = Pair(x, y) // Save for View Map button!
+                        val intent = Intent(this, MapActivity::class.java)
+                        intent.putExtra("userX", x)
+                        intent.putExtra("userY", y)
+                        intent.putExtra("DA", DA)
+                        intent.putExtra("DB", DB)
+                        intent.putExtra("DC", DC)
+                        startActivity(intent)
+                    } else {
+                        Toast.makeText(this, "Could not detect all three LEDs!", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        } else if (mimeType?.startsWith("video") == true) {
+            Toast.makeText(this, "Video processing not implemented.", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Unsupported file type!", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -197,20 +245,16 @@ class MainActivity : AppCompatActivity() {
         viewBinding.startProcessingButton.backgroundTintList =
             ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
-        // No trace drawing is initialized.
     }
 
     private fun stopProcessingAndRecording() {
         isRecording = false
         isProcessing = false
-
-        // Update UI and clear the processed frame view.
         viewBinding.startProcessingButton.text = "Start Tracking"
         viewBinding.startProcessingButton.backgroundTintList =
             ContextCompat.getColorStateList(this, R.color.blue)
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.processedFrameView.setImageBitmap(null)
-
         Toast.makeText(this, "Tracking stopped", Toast.LENGTH_LONG).show()
     }
 
@@ -220,7 +264,7 @@ class MainActivity : AppCompatActivity() {
         isProcessingFrame = true
         videoProcessor?.processFrame(bitmap) { processedFrames ->
             runOnUiThread {
-                processedFrames?.let { (outputBitmap, preprocessedBitmap) ->
+                processedFrames?.let { (outputBitmap, _) ->
                     if (isProcessing) {
                         viewBinding.processedFrameView.setImageBitmap(outputBitmap)
                     }
@@ -309,9 +353,7 @@ class MainActivity : AppCompatActivity() {
 
     private var isFrontCamera = false
     private fun switchCamera() {
-        if (isRecording) {
-            stopProcessingAndRecording()
-        }
+        if (isRecording) stopProcessingAndRecording()
         isFrontCamera = !isFrontCamera
         cameraHelper.isFrontCamera = isFrontCamera
         cameraHelper.closeCamera()
@@ -333,10 +375,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        if (isRecording) {
-            stopProcessingAndRecording()
-        }
-        // If video recording is active, stop it.
+        if (isRecording) stopProcessingAndRecording()
         if (isRecordingVideo) {
             recorderHelper.stopRecordingVideo()
             isRecordingVideo = false
@@ -349,9 +388,7 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
-    private fun allPermissionsGranted(): Boolean {
-        return REQUIRED_PERMISSIONS.all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
+    private fun allPermissionsGranted(): Boolean = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
     }
 }
