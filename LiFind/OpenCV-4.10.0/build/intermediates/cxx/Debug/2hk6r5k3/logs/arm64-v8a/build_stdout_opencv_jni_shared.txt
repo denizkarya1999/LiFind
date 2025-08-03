@@ -1,2 +1,2 @@
-ninja: Entering directory `C:\Users\sashwink\LIFINDAPP\LiFind\OpenCV-4.10.0\.cxx\Debug\2hk6r5k3\arm64-v8a'
+ninja: Entering directory `C:\Users\deniz\AndroidStudioProjects\LiFind\LiFind\OpenCV-4.10.0\.cxx\Debug\2hk6r5k3\arm64-v8a'
 ninja: no work to do.

@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
@@ -27,8 +26,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 
 import com.developer27.lifind.camera.CameraHelper
-import com.developer27.lifind.camera.RecorderHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
+import com.developer27.lifind.trilateration.MapActivity
 import com.developer27.lifind.videoprocessing.VideoProcessor
 import com.developer27.lifind.trilateration.Trilateration
 
@@ -46,9 +45,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: CameraManager
     private lateinit var cameraHelper: CameraHelper
     private var videoProcessor: VideoProcessor? = null
-
-    private lateinit var recorderHelper: RecorderHelper
-    private var isRecordingVideo = false
     private var isRecording = false
     private var isProcessing = false
     private var isProcessingFrame = false
@@ -103,7 +99,6 @@ class MainActivity : AppCompatActivity() {
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         cameraHelper = CameraHelper(this, viewBinding, sharedPreferences)
         videoProcessor = VideoProcessor(this)
-        recorderHelper = RecorderHelper(this, cameraHelper, sharedPreferences, viewBinding)
 
         viewBinding.processedFrameView.visibility = View.GONE
 
@@ -145,22 +140,7 @@ class MainActivity : AppCompatActivity() {
                 startProcessingAndRecording()
             }
         }
-        viewBinding.startRecordingButton.setOnClickListener {
-            if (isRecordingVideo) {
-                recorderHelper.stopRecordingVideo()
-                isRecordingVideo = false
-                viewBinding.startRecordingButton.text = "Capture Video"
-                viewBinding.startRecordingButton.backgroundTintList =
-                    ContextCompat.getColorStateList(this, R.color.green)
-            } else {
-                recorderHelper.startRecordingVideo()
-                isRecordingVideo = true
-                viewBinding.startRecordingButton.text = "Stop Video"
-                viewBinding.startRecordingButton.backgroundTintList =
-                    ContextCompat.getColorStateList(this, R.color.red)
-            }
-        }
-        viewBinding.switchCameraButton.setOnClickListener { switchCamera() }
+
         viewBinding.aboutButton.setOnClickListener {
             startActivity(Intent(this, AboutXameraActivity::class.java))
         }
@@ -351,15 +331,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private var isFrontCamera = false
-    private fun switchCamera() {
-        if (isRecording) stopProcessingAndRecording()
-        isFrontCamera = !isFrontCamera
-        cameraHelper.isFrontCamera = isFrontCamera
-        cameraHelper.closeCamera()
-        cameraHelper.openCamera()
-    }
-
     override fun onResume() {
         super.onResume()
         cameraHelper.startBackgroundThread()
@@ -376,13 +347,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         if (isRecording) stopProcessingAndRecording()
-        if (isRecordingVideo) {
-            recorderHelper.stopRecordingVideo()
-            isRecordingVideo = false
-            viewBinding.startRecordingButton.text = "Capture Video"
-            viewBinding.startRecordingButton.backgroundTintList =
-                ContextCompat.getColorStateList(this, R.color.green)
-        }
         cameraHelper.closeCamera()
         cameraHelper.stopBackgroundThread()
         super.onPause()

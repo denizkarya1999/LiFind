@@ -1,7 +1,9 @@
-package com.developer27.lifind
+package com.developer27.lifind.trilateration
 
 import android.content.Context
-import android.graphics.*
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.os.Bundle
 import android.util.AttributeSet
 import android.view.View

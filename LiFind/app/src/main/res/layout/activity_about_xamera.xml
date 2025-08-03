@@ -30,8 +30,7 @@
             android:background="@android:color/transparent"
             android:src="@drawable/lifind"
             android:scaleType="fitCenter"
-            android:adjustViewBounds="true"
-            android:contentDescription="@string/switch_camera" />
+            android:adjustViewBounds="true" />
 
         <!-- Title Text -->
         <TextView
@@ -84,7 +83,7 @@
             android:id="@+id/textViewVersion"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Version: 1.0 (Pre-Beta)"
+            android:text="Version: 1.0"
             android:textColor="@color/darkBlue"
             android:layout_marginTop="8dp" />
 
@@ -100,7 +99,7 @@
             android:id="@+id/textViewReleaseDate"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Expected Release Date: Mid-May 2025"
+            android:text="Release Date: August 15th 2025"
             android:textColor="@color/darkBlue"
             android:layout_marginTop="8dp" />
 
@@ -108,7 +107,7 @@
             android:id="@+id/textViewDevelopers"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Developers: Nishaant SM, Deniz Acikbas, Ashwin Kumar Sarvadey"
+            android:text="Developers: Deniz Acikbas and Ashwin Kumar Sarvadey"
             android:textColor="@color/darkBlue"
             android:layout_marginTop="8dp" />
 
