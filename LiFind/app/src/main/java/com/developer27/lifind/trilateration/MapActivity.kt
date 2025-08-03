@@ -1,70 +1,114 @@
 package com.developer27.lifind.trilateration
 
+import Trilateration
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Bundle
+import android.os.Environment
 import android.util.AttributeSet
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
+import org.opencv.core.Point
+import java.io.File
 
 class MapActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Receive user position from intent. If missing or (0,0), do not mark.
-        val userX = intent.getDoubleExtra("userX", 0.0)
-        val userY = intent.getDoubleExtra("userY", 0.0)
+        // Locate the log file in public Documents
+        val docsDir = Environment
+            .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        val logFile = File(docsDir, "LiFind_Log.txt")
 
-        setContentView(
-            MapGridView(this).apply {
-                setUserPosition(userX, userY)
+        val ledCenters  = mutableListOf<Point>()
+        val ledDistances = mutableListOf<Double>()
+
+        if (logFile.exists()) {
+            val lines = logFile.readLines()
+            val groups = mutableListOf<MutableList<String>>()
+            var current: MutableList<String>? = null
+
+            // Split into blocks
+            for (line in lines) {
+                if (line.isBlank()) {
+                    current?.let { groups.add(it); current = null }
+                } else {
+                    if (current == null) current = mutableListOf()
+                    current!!.add(line)
+                }
             }
-        )
+            current?.let { groups.add(it) }
+
+            // Parse the most recent block
+            groups.lastOrNull()?.forEach { entry ->
+                when {
+                    entry.contains("LED") && entry.contains("Center:") -> {
+                        // e.g. LED1 Center: x=123.4, y=567.8
+                        Regex("LED\\d+ Center: x=([\\d\\.-]+), y=([\\d\\.-]+)")
+                            .find(entry)
+                            ?.destructured
+                            ?.let { (px, py) ->
+                                ledCenters.add(Point(px.toDouble(), py.toDouble()))
+                            }
+                    }
+                    entry.contains("LED") && entry.contains("Distance:") -> {
+                        // e.g. LED1 Distance: 345.6
+                        Regex("LED\\d+ Distance: ([\\d\\.-]+)")
+                            .find(entry)
+                            ?.groupValues
+                            ?.get(1)
+                            ?.toDoubleOrNull()
+                            ?.let { ledDistances.add(it) }
+                    }
+                }
+            }
+        }
+
+        // Convert to world‐coord pairs
+        val worldCoords = ledCenters.map { it.x to it.y }
+        // Compute predicted position (only if we have exactly 3 LEDs + distances)
+        val (predX, predY) = if (worldCoords.size == 3 && ledDistances.size == 3) {
+            Trilateration.solve(worldCoords, ledDistances)
+        } else {
+            0.0 to 0.0
+        }
+
+        // Build view and pass parsed positions & distances
+        val mapView = MapGridView(this).apply {
+            setUserPixelPosition(predX, predY)
+            setDetectedPixelData(ledCenters, ledDistances)
+        }
+        setContentView(mapView)
     }
 }
 
+
 class MapGridView @JvmOverloads constructor(
-    context: Context, attrs: AttributeSet? = null
+    context: Context,
+    attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    // Map axis and display settings
-    private val minX = -5
-    private val maxX = 5
-    private val minY = -5
-    private val maxY = 5
-    private val step = 1
+    private val paintGrid   = Paint().apply { color = Color.LTGRAY; strokeWidth = 2f; isAntiAlias = true }
+    private val paintAxis   = Paint().apply { color = Color.DKGRAY; strokeWidth = 4f; isAntiAlias = true }
+    private val paintCircle = Paint().apply { color = Color.MAGENTA; style = Paint.Style.FILL; isAntiAlias = true }
+    private val paintUser   = Paint().apply { color = Color.BLUE; strokeWidth = 8f; isAntiAlias = true }
 
-    // LED layout: (x, y, color, label)
-    private val ledList = listOf(
-        Triple(0.0, 0.0, Pair(Color.RED, "LED1 (0,0)")),
-        Triple(-2.0, -2.0, Pair(Color.BLUE, "LED2 (-2,-2)")),
-        Triple(2.0, -2.0, Pair(Color.GREEN, "LED3 (2,-2)"))
-    )
+    private var userPoint: Point? = null
+    private var detectedPts: List<Point> = emptyList()
+    private var detectedDists: List<Double> = emptyList()
 
-    private var userPoint: Pair<Double, Double>? = null
-
-    // Padding/borders around drawable area
-    private val sidePad = 50f
-    private val labelPad = 15f
-
-    // Coordinate mapping
-    private fun worldToScreenX(x: Double): Float {
-        val w = width - 2 * sidePad
-        return ((x - minX) / (maxX - minX) * w + sidePad).toFloat()
-    }
-    private fun worldToScreenY(y: Double): Float {
-        // Y up in world, down in screen!
-        val h = height - 2 * sidePad
-        return ((maxY - y) / (maxY - minY) * h + sidePad).toFloat()
+    /** Set last trilaterated position in pixel space */
+    fun setUserPixelPosition(x: Double, y: Double) {
+        userPoint = Point(x, y)
+        invalidate()
     }
 
-    /**
-     * Sets and draws user position only if it's not (0,0).
-     */
-    fun setUserPosition(x: Double, y: Double) {
-        userPoint = if (x != 0.0 || y != 0.0) Pair(x, y) else null
+    /** Set raw LED centers *and* distances */
+    fun setDetectedPixelData(pts: List<Point>, dists: List<Double>) {
+        detectedPts  = pts
+        detectedDists = dists
         invalidate()
     }
 
@@ -72,83 +116,56 @@ class MapGridView @JvmOverloads constructor(
         super.onDraw(canvas)
         drawGrid(canvas)
         drawAxes(canvas)
-        drawLEDs(canvas)
+        drawDetectedLeds(canvas)
         drawUser(canvas)
     }
 
     private fun drawGrid(canvas: Canvas) {
-        val paint = Paint().apply {
-            color = Color.LTGRAY
-            strokeWidth = 2f
+        val step = 100
+        for (i in 0 until width step step) {
+            canvas.drawLine(i.toFloat(), 0f, i.toFloat(), height.toFloat(), paintGrid)
         }
-        for (i in minX..maxX) {
-            val sx = worldToScreenX(i.toDouble())
-            canvas.drawLine(sx, worldToScreenY(minY.toDouble()), sx, worldToScreenY(maxY.toDouble()), paint)
-        }
-        for (j in minY..maxY) {
-            val sy = worldToScreenY(j.toDouble())
-            canvas.drawLine(worldToScreenX(minX.toDouble()), sy, worldToScreenX(maxX.toDouble()), sy, paint)
+        for (j in 0 until height step step) {
+            canvas.drawLine(0f, j.toFloat(), width.toFloat(), j.toFloat(), paintGrid)
         }
     }
 
     private fun drawAxes(canvas: Canvas) {
-        val paint = Paint().apply {
-            color = Color.DKGRAY
-            strokeWidth = 5f
-        }
-        // X axis
-        canvas.drawLine(
-            worldToScreenX(minX.toDouble()), worldToScreenY(0.0),
-            worldToScreenX(maxX.toDouble()), worldToScreenY(0.0), paint)
-        // Y axis
-        canvas.drawLine(
-            worldToScreenX(0.0), worldToScreenY(minY.toDouble()),
-            worldToScreenX(0.0), worldToScreenY(maxY.toDouble()), paint)
+        val cx = width / 2f
+        canvas.drawLine(cx, 0f, cx, height.toFloat(), paintAxis)
+        val cy = height / 2f
+        canvas.drawLine(0f, cy, width.toFloat(), cy, paintAxis)
     }
 
-    private fun drawLEDs(canvas: Canvas) {
-        val circleRadius = 22f
+    private fun drawDetectedLeds(canvas: Canvas) {
         val textPaint = Paint().apply {
-            color = Color.BLACK
-            textSize = 34f
+            color = Color.WHITE
+            textSize = 48f
             isAntiAlias = true
+            textAlign = Paint.Align.CENTER
         }
-        ledList.forEach { (x, y, info) ->
-            val (col, label) = info
-            val paintCircle = Paint().apply {
-                color = col
-                isAntiAlias = true
-            }
-            val screenX = worldToScreenX(x)
-            val screenY = worldToScreenY(y)
-            canvas.drawCircle(screenX, screenY, circleRadius, paintCircle)
-            // Label: right of marker
-            canvas.drawText(label, screenX + labelPad, screenY - labelPad, textPaint)
+        val radius = 40f
+        val labelOffset = radius + 16f
+
+        detectedPts.forEachIndexed { i, pt ->
+            val x = pt.x.toFloat()
+            val y = pt.y.toFloat()
+            canvas.drawCircle(x, y, radius, paintCircle)
+
+            val distText = detectedDists.getOrNull(i)?.let { "%.2f".format(it) } ?: "?.??"
+            val label = "LED${i+1} | $distText"
+
+            canvas.drawText(label, x, y - labelOffset, textPaint)
         }
     }
 
     private fun drawUser(canvas: Canvas) {
-        val user = userPoint ?: return
-        val x = worldToScreenX(user.first)
-        val y = worldToScreenY(user.second)
-
-        // Draw a large "X" at user position
-        val markSize = 30f
-        val paint = Paint().apply {
-            color = Color.BLACK
-            strokeWidth = 8f
-            isAntiAlias = true
+        userPoint?.let { p ->
+            val x = p.x.toFloat()
+            val y = p.y.toFloat()
+            val s = 30f
+            canvas.drawLine(x - s, y - s, x + s, y + s, paintUser)
+            canvas.drawLine(x - s, y + s, x + s, y - s, paintUser)
         }
-        canvas.drawLine(x - markSize, y - markSize, x + markSize, y + markSize, paint)
-        canvas.drawLine(x - markSize, y + markSize, x + markSize, y - markSize, paint)
-
-        // Show user coordinates as text
-        val coordText = "(${String.format("%.2f", user.first)}, ${String.format("%.2f", user.second)})"
-        val textPaint = Paint().apply {
-            color = Color.BLACK
-            textSize = 34f
-            isAntiAlias = true
-        }
-        canvas.drawText(coordText, x + labelPad, y - labelPad, textPaint)
     }
 }
