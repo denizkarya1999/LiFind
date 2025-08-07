@@ -19,8 +19,9 @@ import org.tensorflow.lite.support.image.TensorImage
 import java.io.File
 import java.io.FileWriter
 import java.io.IOException
-import kotlin.math.pow
-import kotlin.math.sqrt
+import kotlin.math.min
+
+private fun Float.format(digits: Int) = "%.${digits}f".format(this)
 
 // Holds the last set of LED distances: (classId, distance)
 private var lastLedDistances: List<Pair<Int, Double>> = emptyList()
@@ -39,26 +40,16 @@ data class DetectionResult(
     val confidence: Float,
     val classId: Int
 )
-data class BoundingBox(
-    val x1: Float,
-    val y1: Float,
-    val x2: Float,
-    val y2: Float,
-    val confidence: Float,
-    val classId: Int
-)
 
-var yoloInterpreter: Interpreter? = null
 var distanceInterpreter: Interpreter? = null
 
 object Settings {
     object DetectionMode {
         enum class Mode { YOLO }
         var current: Mode = Mode.YOLO
-        var enableYOLOinference = true
     }
     object Inference {
-        var confidenceThreshold: Float = 0.3f
+        var confidenceThreshold: Float = 0.00000f
     }
     object BoundingBox {
         var enableBoundingBox = true
@@ -73,7 +64,6 @@ class VideoProcessor(private val context: Context) {
     fun getLastLedCenters(): List<Pair<Int, Point>> = lastLedCenters
     fun getLastUserPosition(): Pair<Double, Double> = lastUserPosition
 
-
     init {
         initOpenCV()
     }
@@ -84,11 +74,6 @@ class VideoProcessor(private val context: Context) {
         } catch (e: UnsatisfiedLinkError) {
             Log.d("VideoProcessor", "OpenCV failed to load: ${e.message}", e)
         }
-    }
-
-    fun setYoloInterpreter(model: Interpreter) = synchronized(this) {
-        yoloInterpreter = model
-        Log.d("VideoProcessor", "YOLO Interpreter set")
     }
 
     fun setDistanceInterpreter(model: Interpreter) = synchronized(this) {
@@ -113,68 +98,95 @@ class VideoProcessor(private val context: Context) {
     private suspend fun processFrameInternalYOLO(
         bitmap: Bitmap
     ): Pair<Bitmap, Bitmap> = withContext(Dispatchers.IO) {
-
         val tag = javaClass.simpleName
 
-        // Prepare model input
+        // 1) Prepare model input: letterbox the camera frame
         val (inputW, inputH, outputShape) = getModelDimensions()
         val (letterboxed, offsets) =
             YOLOHelper.createLetterboxedBitmap(bitmap, inputW, inputH)
         val tensorImage = TensorImage(DataType.FLOAT32).apply { load(letterboxed) }
-        val m = Mat().also { Utils.bitmapToMat(bitmap, it) }
 
-        // Temporary lists
+        // 2) Create an OpenCV Mat from the letterboxed image
+        val m = Mat().also { Utils.bitmapToMat(letterboxed, it) }
+
+        // 3) Temporary holders
         val ledDistancesList = mutableListOf<Pair<Int, Double>>()
         val ledCentersList   = mutableListOf<Pair<Int, Point>>()
 
-        // Run YOLO inference
-        if (Settings.DetectionMode.enableYOLOinference && yoloInterpreter != null) {
-            val yoloOut = Array(outputShape[0]) {
+// 4) Run the distance model, collect circles but don’t draw yet
+        val circlesToDraw = mutableListOf<Triple<Point, Int, String>>()
+
+        distanceInterpreter?.let { interpreter ->
+            val distOut = Array(outputShape[0]) {
                 Array(outputShape[1]) { FloatArray(outputShape[2]) }
             }
-            tensorImage.buffer.also { yoloInterpreter!!.run(it, yoloOut) }
+            interpreter.run(tensorImage.buffer, distOut)
 
-            val yoloDetections = YOLOHelper.parseTFLite(yoloOut)
+            val bestPerLed = YOLOHelper.parseTFLite(distOut)
                 ?.filter { it.confidence > Settings.Inference.confidenceThreshold }
-                ?.distinctBy { it.classId }
-                ?.take(3)
-                ?.sortedBy { it.classId }
-
-            yoloDetections?.forEach { det ->
-                val (box, center) = YOLOHelper.rescaleInferencedCoordinates(
-                    det, bitmap.width, bitmap.height, offsets, inputW, inputH
-                )
-                ledCentersList.add(Pair(det.classId, center))
-
-                if (Settings.BoundingBox.enableBoundingBox) {
-                    val label = "${YOLOHelper.classNameForId(det.classId)} " +
-                            "(${String.format("%.2f", det.confidence * 100)}%)"
-                    YOLOHelper.drawDetectionCircleWithLabel(m, center, box, label)
+                ?.groupBy { det ->
+                    YOLOHelper.classNameForId(det.classId).substringBefore('_').toInt()
                 }
+                ?.map { (_, dets) -> dets.maxByOrNull { it.confidence }!! }
+                ?: emptyList()
 
-                val pixelDist = sqrt(
-                    (center.x - bitmap.width / 2).pow(2) +
-                            (center.y - bitmap.height / 2).pow(2)
-                )
-                ledDistancesList.add(Pair(det.classId, pixelDist))
-            }
+            bestPerLed
+                .sortedByDescending { it.confidence }
+                .take(3)
+                .sortedBy { det ->
+                    YOLOHelper.classNameForId(det.classId).substringBefore('_').toInt()
+                }
+                .forEach { det ->
+                    val parts    = YOLOHelper.classNameForId(det.classId).split('_')
+                    val ledId    = parts[0].toInt()
+                    val distance = parts[1].toDouble()
+
+                    val (center, radius) = YOLOHelper.rescaleToCenterAndRadius(
+                        det,
+                        letterboxed.width,
+                        letterboxed.height,
+                        offsets,
+                        inputW,
+                        inputH
+                    )
+
+                    Log.i(tag, "LED$ledId raw center = x=${"%.1f".format(center.x)}, y=${"%.1f".format(center.y)}, radius=$radius")
+
+                    // 1) Rescale from model‐input → camera frame:
+                    val (rawW, rawH) = bitmap.width.toDouble() to bitmap.height.toDouble()
+                    val (inW, inH)   = inputW.toDouble()    to inputH.toDouble()
+                    val scaleX       = rawW / inW
+                    val scaleY       = rawH / inH
+
+                    val rawX    = center.x * scaleX
+                    val rawY    = center.y * scaleY
+                    val rawRad  = (radius * min(scaleX, scaleY)).toInt()
+
+                    // 2) Clamp to screen bounds
+                    val clampedX = rawX.coerceAtLeast(0.0).coerceAtMost(rawW)
+                    val clampedY = rawY.coerceAtLeast(0.0).coerceAtMost(rawH)
+
+                    // 4) Buffer the fitted values
+                    circlesToDraw += Triple(Point(clampedX, clampedY), 300, "LED$ledId")
+
+                    // record for trilateration
+                    ledCentersList   .add(ledId to center)
+                    ledDistancesList .add(ledId to distance)
+                }
         }
 
-        // Save latest lists
+        // 5) Trilaterate user position
         lastLedDistances = ledDistancesList.sortedBy { it.first }.take(3)
         lastLedCenters   = ledCentersList  .sortedBy { it.first }.take(3)
-
-        // Trilaterate
         lastUserPosition = if (lastLedDistances.size == 3) {
             val (dA, dB, dC) = lastLedDistances.map { it.second }
             Trilateration.solve(dA, dB, dC)
         } else {
-            Pair(0.0, 0.0)
+            0.0 to 0.0
         }
-
         Log.d(tag, "User position: x=${lastUserPosition.first}, y=${lastUserPosition.second}")
 
-        // Write to public Documents directory, clearing any old log first
+        // 6) Write only the user position to log
         try {
             val docsDir = Environment
                 .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
@@ -182,47 +194,44 @@ class VideoProcessor(private val context: Context) {
                 Log.e(tag, "Failed to create Documents directory")
             }
             val logFile = File(docsDir, "LiFind_Log.txt")
-
-            // Clear any existing file
-            if (logFile.exists()) {
-                logFile.delete()
-            }
-
-            FileWriter(logFile, /*append=*/false).use { writer ->
-                // User position
+            if (logFile.exists()) logFile.delete()
+            FileWriter(logFile, false).use { writer ->
                 writer.append("UserPosition: x=${lastUserPosition.first}, y=${lastUserPosition.second}\n")
-
-                // LED centers
-                lastLedCenters.forEach { (id, pt) ->
-                    writer.append("LED$id Center: x=${pt.x}, y=${pt.y}\n")
-                }
-
-                // LED distances
-                lastLedDistances.forEach { (id, dist) ->
-                    writer.append("LED$id Distance: ${"%.2f".format(dist)}\n")
-                }
-
-                writer.append("\n")
             }
-            Log.d(tag, "Wrote new log to ${logFile.absolutePath}")
+            Log.d(tag, "Wrote user position to ${logFile.absolutePath}")
         } catch (e: IOException) {
-            Log.e(tag, "Failed to write log to Documents", e)
+            Log.e(tag, "Failed to write user position", e)
         }
 
+        // draw the detection circle & label
+        if (Settings.BoundingBox.enableBoundingBox) {
+            for ((center, radius, label) in circlesToDraw) {
+                YOLOHelper.drawDetectionCircleWithLabel(
+                    m, center, radius, label
+                )
+            }
+        }
+
+        // 7) Convert the letterboxed Mat (with circles) back into a Bitmap
         val outBmp = Bitmap.createBitmap(
-            bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888
-        ).also { Utils.matToBitmap(m, it); m.release() }
+            letterboxed.width,
+            letterboxed.height,
+            letterboxed.config
+        ).also {
+            Utils.matToBitmap(m, it)
+            m.release()
+        }
 
         outBmp to letterboxed
     }
 
     fun getModelDimensions(): Triple<Int, Int, List<Int>> {
-        val inTensor = yoloInterpreter?.getInputTensor(0)
-        val shapeIn  = inTensor?.shape()
-        val h = shapeIn?.getOrNull(1) ?: 416
-        val w = shapeIn?.getOrNull(2) ?: 416
-        val outTensor = yoloInterpreter?.getOutputTensor(0)
-        val shapeOut = outTensor?.shape()?.toList() ?: listOf(1, 1, 9)
+        val inTensor  = distanceInterpreter?.getInputTensor(0)
+        val shapeIn   = inTensor?.shape()
+        val h         = shapeIn?.getOrNull(1) ?: 416
+        val w         = shapeIn?.getOrNull(2) ?: 416
+        val outTensor = distanceInterpreter?.getOutputTensor(0)
+        val shapeOut  = outTensor?.shape()?.toList() ?: listOf(1, 1, 9)
         return Triple(w, h, shapeOut)
     }
 }

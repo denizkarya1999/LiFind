@@ -1,5 +1,6 @@
 package com.developer27.lifind
 
+import Trilateration
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
@@ -148,8 +149,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        loadTFLiteModelOnStartupThreaded("best-fp16.tflite")
-        loadTFLiteModelOnStartupThreaded("Distance_YOLOv8_float32.tflite")
+        loadDistanceModelOnStartupThreaded()
 
         cameraHelper.setupZoomControls()
         sharedPreferences.registerOnSharedPreferenceChangeListener { _, key ->
@@ -305,7 +305,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 .setNegativeButton("No", null)
                 .show()
-        }, 3000L)
+        }, 30000000L)
     }
     private fun stopProcessingAndRecording() {
         isRecording = false
@@ -334,58 +334,54 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadTFLiteModelOnStartupThreaded(modelName: String) {
+    /** === New loader, only ever loads Distance_YOLOv8_float32.tflite ==== */
+    private fun loadDistanceModelOnStartupThreaded() {
         Thread {
-            val bestLoadedPath = copyAssetModelBlocking(modelName)
+            val modelFileName = "Distance_YOLOv8_float32.tflite"
+            val modelPath = copyAssetModelBlocking(modelFileName)
             runOnUiThread {
-                if (bestLoadedPath.isNotEmpty()) {
-                    try {
-                        val options = Interpreter.Options().apply {
-                            setNumThreads(Runtime.getRuntime().availableProcessors())
-                        }
-                        var delegateAdded = false
-                        try {
-                            val nnApiDelegate = NnApiDelegate()
-                            options.addDelegate(nnApiDelegate)
-                            delegateAdded = true
-                            Log.d("MainActivity", "NNAPI delegate added successfully.")
-                        } catch (e: Exception) {
-                            Log.d("MainActivity", "NNAPI delegate unavailable, falling back to GPU delegate.", e)
-                        }
-                        if (!delegateAdded) {
-                            try {
-                                val gpuDelegate = GpuDelegate()
-                                options.addDelegate(gpuDelegate)
-                                Log.d("MainActivity", "GPU delegate added successfully.")
-                            } catch (e: Exception) {
-                                Log.d("MainActivity", "GPU delegate unavailable, will use CPU only.", e)
-                            }
-                        }
-                        when (modelName) {
-                            "best-fp16.tflite" -> {
-                                videoProcessor?.setYoloInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
-                            }
-                            "Distance_YOLOv8_float32.tflite" -> {
-                                videoProcessor?.setDistanceInterpreter(Interpreter(loadMappedFile(bestLoadedPath), options))
-                            }
-                            else -> Log.d("MainActivity", "No model processing method defined for $modelName")
-                        }
-                    } catch (e: Exception) {
-                        Toast.makeText(this, "Error loading TFLite model: ${e.message}", Toast.LENGTH_LONG).show()
-                        Log.d("MainActivity", "TFLite Interpreter error", e)
+                if (modelPath.isEmpty()) {
+                    Toast.makeText(this,
+                        "Failed to copy or load $modelFileName",
+                        Toast.LENGTH_SHORT).show()
+                    return@runOnUiThread
+                }
+                try {
+                    val options = Interpreter.Options().apply {
+                        setNumThreads(Runtime.getRuntime().availableProcessors())
                     }
-                } else {
-                    Toast.makeText(this, "Failed to copy or load $modelName", Toast.LENGTH_SHORT).show()
+                    var delegateAdded = false
+                    try {
+                        options.addDelegate(NnApiDelegate()).also { delegateAdded = true }
+                        Log.d("MainActivity", "NNAPI delegate added.")
+                    } catch (_: Exception) { }
+                    if (!delegateAdded) {
+                        try {
+                            options.addDelegate(GpuDelegate())
+                            Log.d("MainActivity", "GPU delegate added.")
+                        } catch (_: Exception) { }
+                    }
+
+                    val mappedBuf = loadMappedFile(modelPath)
+                    val distanceInterp = Interpreter(mappedBuf, options)
+                    videoProcessor?.setDistanceInterpreter(distanceInterp)
+                    Log.d("MainActivity", "$modelFileName loaded into VideoProcessor")
+                } catch (e: Exception) {
+                    Toast.makeText(this,
+                        "Error loading model: ${e.message}",
+                        Toast.LENGTH_LONG).show()
+                    Log.e("MainActivity", "TFLite load error", e)
                 }
             }
         }.start()
     }
 
+    /** Helper stays the same */
     private fun loadMappedFile(modelPath: String): MappedByteBuffer {
         val file = File(modelPath)
-        val fileInputStream = file.inputStream()
-        val fileChannel = fileInputStream.channel
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
+        return file.inputStream()
+            .channel
+            .map(FileChannel.MapMode.READ_ONLY, 0, file.length())
     }
 
     private fun copyAssetModelBlocking(assetName: String): String {

@@ -11,166 +11,149 @@ import org.opencv.imgproc.Imgproc
 import kotlin.math.min
 
 object YOLOHelper {
-    private val classNames = arrayOf("LED1", "LED2", "LED3")
+    // Your distance‐label class names
+    private val classNames = arrayOf(
+        "6_10","6_11","6_12","6_2","6_3","6_4","6_5","6_6","6_7","6_8","6_9",
+        "7_10","7_11","7_12","7_2","7_3","7_4","7_5","7_6","7_7","7_8","7_9",
+        "8_10","8_11","8_12","8_2","8_3","8_4","8_5","8_6","8_7","8_8","8_9"
+    )
 
+    /** Map a class index into its “led_distance” string */
     fun classNameForId(classId: Int): String =
-        if (classId in classNames.indices) classNames[classId] else "Unknown"
+        classNames.getOrNull(classId) ?: "Unknown"
 
-    // Model expects numDistanceClasses; placeholder here
-    val numDistanceClasses = 33 // Update with your real value if needed
-
-    /** Parse TFLite output into DetectionResult list above confidence threshold */
+    /** Parse model output into DetectionResult list above confidence threshold */
     fun parseTFLite(rawOutput: Array<Array<FloatArray>>): List<DetectionResult>? {
-        // Only first batch
-        val predictions = rawOutput[0]
-        val detections = mutableListOf<DetectionResult>()
-        for (row in predictions) {
-            if (row.size < 6) continue
-            val xCenter = row[0]
-            val yCenter = row[1]
-            val width = row[2]
-            val height = row[3]
-            val objectConf = row[4]
-            val classScores = row.copyOfRange(5, row.size)
-            val bestClassIdx = classScores.indices.maxByOrNull { classScores[it] } ?: -1
-            val bestClassScore = classScores.getOrNull(bestClassIdx) ?: 0f
-            val finalConf = objectConf * bestClassScore
-            if (finalConf >= Settings.Inference.confidenceThreshold) {
-                detections.add(
-                    DetectionResult(
-                        xCenter, yCenter, width, height, finalConf, bestClassIdx
-                    )
-                )
+        val preds = rawOutput[0]   // preds.size == numCells
+        val dets  = mutableListOf<DetectionResult>()
+        for (row in preds) {
+            if (row.size < 5 + classNames.size) continue
+
+            // box coords + obj
+            val xC = row[0]
+            val yC = row[1]
+            val w  = row[2]
+            val h  = row[3]
+            val objConf = row[4]
+
+            // **only** look at the next 33 scores
+            val classScores = row.sliceArray(5 until 5 + classNames.size)
+            val bestIdx     = classScores.indices.maxByOrNull { classScores[it] } ?: -1
+            val bestScore   = classScores.getOrNull(bestIdx) ?: 0f
+            val conf        = objConf * bestScore
+
+            if (conf >= Settings.Inference.confidenceThreshold) {
+                dets += DetectionResult(xC, yC, w, h, conf, bestIdx)
             }
         }
-        return if (detections.isEmpty()) null else detections
+        return dets.ifEmpty { null }
     }
 
-    /** Rescale detected box center from net input size to image coordinates, with aspect correction */
-    fun rescaleInferencedCoordinates(
-        detection: DetectionResult,
-        originalWidth: Int,
-        originalHeight: Int,
+    /**
+     * Convert a DetectionResult back into:
+     *  - the detection center in original‐image coordinates
+     *  - a radius (half the smaller box dimension) in pixels
+     */
+    fun rescaleToCenterAndRadius(
+        det: DetectionResult,
+        origW: Int,
+        origH: Int,
         padOffsets: Pair<Int, Int>,
-        modelInputWidth: Int,
-        modelInputHeight: Int
-    ): Pair<BoundingBox, Point> {
-        val scale = min(
-            modelInputWidth / originalWidth.toDouble(),
-            modelInputHeight / originalHeight.toDouble()
-        )
-        val padLeft = padOffsets.first.toDouble()
-        val padTop = padOffsets.second.toDouble()
-        val xCenterLetterboxed = detection.xCenter * modelInputWidth
-        val yCenterLetterboxed = detection.yCenter * modelInputHeight
-        val boxWidthLetterboxed = detection.width * modelInputWidth
-        val boxHeightLetterboxed = detection.height * modelInputHeight
-        val xCenterOriginal = (xCenterLetterboxed - padLeft) / scale
-        val yCenterOriginal = (yCenterLetterboxed - padTop) / scale
-        val boxWidthOriginal = boxWidthLetterboxed / scale
-        val boxHeightOriginal = boxHeightLetterboxed / scale
-        val x1Original = xCenterOriginal - (boxWidthOriginal / 2)
-        val y1Original = yCenterOriginal - (boxHeightOriginal / 2)
-        val x2Original = xCenterOriginal + (boxWidthOriginal / 2)
-        val y2Original = yCenterOriginal + (boxHeightOriginal / 2)
-        val boundingBox = BoundingBox(
-            x1 = x1Original.toFloat(),
-            y1 = y1Original.toFloat(),
-            x2 = x2Original.toFloat(),
-            y2 = y2Original.toFloat(),
-            confidence = detection.confidence,
-            classId = detection.classId
-        )
-        val center = Point(xCenterOriginal, yCenterOriginal)
-        return Pair(boundingBox, center)
+        inW: Int,
+        inH: Int
+    ): Pair<Point, Int> {
+        // undo letterbox + normalization
+        val scale = min(inW.toDouble()/origW, inH.toDouble()/origH)
+        val padX  = padOffsets.first.toDouble()
+        val padY  = padOffsets.second.toDouble()
+
+        val xCl = det.xCenter * inW
+        val yCl = det.yCenter * inH
+        val wL  = det.width   * inW
+        val hL  = det.height  * inH
+
+        val xC = (xCl - padX) / scale
+        val yC = (yCl - padY) / scale
+        val wO = wL  / scale
+        val hO = hL  / scale
+
+        val center = Point(xC, yC)
+        val radius = ((min(wO, hO) / 2)).toInt()
+        return center to radius
     }
 
-    /** Letterbox (pad and scale) the bitmap to model input size, keeping aspect ratio */
+    /**
+     * Letterbox an image for model input. Returns the padded Bitmap plus
+     * the (left, top) padding offsets needed to map back.
+     */
     fun createLetterboxedBitmap(
-        srcBitmap: Bitmap,
-        targetWidth: Int,
-        targetHeight: Int,
+        src: Bitmap,
+        targetW: Int,
+        targetH: Int,
         padColor: Scalar = Scalar(0.0, 0.0, 0.0)
     ): Pair<Bitmap, Pair<Int, Int>> {
-        val srcMat = Mat().also { Utils.bitmapToMat(srcBitmap, it) }
-        val srcWidth = srcMat.cols().toDouble()
-        val srcHeight = srcMat.rows().toDouble()
-        val scale = min(
-            targetWidth / srcWidth,
-            targetHeight / srcHeight
-        )
-        val newWidth = (srcWidth * scale).toInt()
-        val newHeight = (srcHeight * scale).toInt()
+        val mat = Mat().also { Utils.bitmapToMat(src, it) }
+        val sw  = mat.cols().toDouble()
+        val sh  = mat.rows().toDouble()
+        val scale = min(targetW / sw, targetH / sh)
+        val nw = (sw * scale).toInt()
+        val nh = (sh * scale).toInt()
+
         val resized = Mat().also {
-            Imgproc.resize(srcMat, it, Size(newWidth.toDouble(), newHeight.toDouble()))
-            srcMat.release()
+            Imgproc.resize(mat, it, Size(nw.toDouble(), nh.toDouble()))
+            mat.release()
         }
-        val padWidth = targetWidth - newWidth
-        val padHeight = targetHeight - newHeight
-        val (top, bottom) = padHeight / 2 to (padHeight - padHeight / 2)
-        val (left, right) = padWidth / 2 to (padWidth - padWidth / 2)
+
+        val padW = targetW - nw
+        val padH = targetH - nh
+        val (top, bottom) = padH/2 to (padH - padH/2)
+        val (left, right) = padW/2 to (padW - padW/2)
+
         val letterboxed = Mat().also {
-            Core.copyMakeBorder(
-                resized, it,
-                top, bottom,
-                left, right,
-                Core.BORDER_CONSTANT,
-                padColor
+            Core.copyMakeBorder(resized, it,
+                top, bottom, left, right,
+                Core.BORDER_CONSTANT, padColor
             )
             resized.release()
         }
-        val outputBitmap = Bitmap.createBitmap(
+
+        val outBmp = Bitmap.createBitmap(
             letterboxed.cols(),
             letterboxed.rows(),
-            srcBitmap.config
+            src.config
         ).apply {
             Utils.matToBitmap(letterboxed, this)
             letterboxed.release()
         }
-        return Pair(outputBitmap, Pair(left, top))
+
+        return outBmp to Pair(left, top)
     }
 
-    /** Draws the detection circle and label on image */
+    /**
+     * Draws only a circle around a detection center (no rectangle),
+     * plus a text label just above it.
+     */
     fun drawDetectionCircleWithLabel(
         mat: Mat,
         center: Point,
-        box: BoundingBox,
-        labelText: String
+        radius: Int,
+        label: String
     ) {
-        val boxWidth = box.x2 - box.x1
-        val boxHeight = box.y2 - box.y1
-        val baseRadius = (min(boxWidth, boxHeight) / 2).toInt()
-        val radius = (baseRadius * 3.5f).toInt()
+        if (!Settings.BoundingBox.enableBoundingBox) return
+
         Imgproc.circle(
             mat, center, radius,
             Settings.BoundingBox.boxColor,
             Settings.BoundingBox.boxThickness
         )
-        // Label
-        val fontScale = 2.0
-        val thickness = 2
-        val baseline = IntArray(1)
-        val textSize = Imgproc.getTextSize(
-            labelText, Imgproc.FONT_HERSHEY_SIMPLEX,
-            fontScale, thickness,
-            baseline
-        )
-        val textX = (center.x - textSize.width / 2).toInt().coerceAtLeast(0)
-        val textY = (center.y - radius - 5).toInt().coerceAtLeast((textSize.height + baseline[0]).toInt())
-        Imgproc.rectangle(
-            mat,
-            Point(textX.toDouble(), (textY + baseline[0]).toDouble()),
-            Point((textX + textSize.width).toDouble(), (textY - textSize.height).toDouble()),
-            Settings.BoundingBox.boxColor,
-            Imgproc.FILLED
-        )
+
         Imgproc.putText(
-            mat, labelText,
-            Point(textX.toDouble(), textY.toDouble()),
+            mat, label,
+            Point(center.x - radius, center.y - radius - 10),
             Imgproc.FONT_HERSHEY_SIMPLEX,
-            fontScale,
-            Scalar(0.0, 0.0, 0.0),
-            thickness
+            0.5,
+            Settings.BoundingBox.boxColor,
+            Settings.BoundingBox.boxThickness
         )
     }
 }
