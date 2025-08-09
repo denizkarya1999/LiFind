@@ -273,7 +273,7 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
 
-        // After 3 seconds, ask the user whether to launch MapActivity
+        // After 5 seconds, ask the user whether to launch MapActivity
         Handler(Looper.getMainLooper()).postDelayed({
             // 1) stop processing immediately
             stopProcessingAndRecording()
@@ -305,7 +305,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 .setNegativeButton("No", null)
                 .show()
-        }, 30000000L)
+        }, 5000L)
     }
     private fun stopProcessingAndRecording() {
         isRecording = false
