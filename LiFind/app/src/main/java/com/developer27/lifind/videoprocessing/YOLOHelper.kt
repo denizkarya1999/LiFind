@@ -1,186 +1,227 @@
 package com.developer27.lifind.videoprocessing
 
+import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Rect
-import org.opencv.core.Point
-import kotlin.math.max
-import kotlin.math.min
+import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 
 /**
- * Utilities for TFLite YOLO inference and drawing.
- * Works with your DetectionResult data class and Settings object.
+ * Helper that:
+ *  - Loads/caches the TFLite interpreter
+ *  - Normalizes/Parses YOLO head output ([1,84,8400] or [1,8400,84])
+ *  - Applies NMS (class-agnostic or per-class)
+ *  - Offers utilities used by VideoProcessor
  */
-object YOLOHelper {
+object YOLOHelperV2 {
 
-    // === Your classes (LED id and distance buckets) ===
-    private val classNames = arrayOf(
-        "1000_3", "1000_4", "1000_5", "1000_6", "1000_7", "1000_8", "1000_9", "1000_10", "1000_11", "1000_12",
-        "1001_3", "1001_4", "1001_5", "1001_6", "1001_7", "1001_8", "1001_9", "1001_10", "1001_11", "1001_12",
-        "1010_3", "1010_4", "1010_5", "1010_6", "1010_7", "1010_8", "1010_9", "1010_10", "1010_11", "1010_12",
-    )
+    const val INPUT_SIZE = 640
+    private const val MODEL_ASSET_NAME = "lifind_led_100_iso_model.tflite"
 
-    fun classNameForId(id: Int): String =
-        if (id in classNames.indices) classNames[id] else "unknown"
+    @Volatile private var interpreter: Interpreter? = null
 
-    // ---- Image prep: letterbox to model input (returns offsets left/top) ----
-    fun createLetterboxedBitmap(src: Bitmap, dstW: Int, dstH: Int): Pair<Bitmap, Pair<Int, Int>> {
-        val out = Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
+    @Synchronized
+    fun ensureInterpreter(context: Context): Interpreter {
+        interpreter?.let { return it }
 
-        val scale = min(dstW.toFloat() / src.width, dstH.toFloat() / src.height)
-        val newW = (src.width * scale).toInt()
-        val newH = (src.height * scale).toInt()
-        val left = ((dstW - newW) / 2f).toInt()
-        val top = ((dstH - newH) / 2f).toInt()
-
-        // Optional: clear background
-        canvas.drawColor(Color.BLACK)
-
-        val srcRect = Rect(0, 0, src.width, src.height)
-        val dstRect = Rect(left, top, left + newW, top + newH)
-        canvas.drawBitmap(src, srcRect, dstRect, null)
-
-        return out to (left to top)
+        val opts = Interpreter.Options().apply {
+            // Reasonable default; change if needed
+            setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtLeast(2))
+        }
+        val mapped = loadModelFromAssets(context, MODEL_ASSET_NAME)
+        val interp = Interpreter(mapped, opts)
+        interpreter = interp
+        return interp
     }
 
-    // YOLOHelper.kt
-    // Parse a YOLO-style TFLite head WITHOUT applying sigmoid in code.
-    // Assumes the model already outputs probabilities in [0,1].
-    // Expected output shape: [1, N, 5+numClasses]
-    //   per row: [x, y, w, h, obj, c0, c1, ...]
-    //   where x,y,w,h are normalized to the model input (letterboxed canvas).
-    fun parseTFLite(out: Array<Array<FloatArray>>): List<DetectionResult>? {
-        // 0) Quick sanity checks: if batch or rows are missing, return empty.
-        if (out.isEmpty() || out[0].isEmpty()) return emptyList()
+    fun closeInterpreter() {
+        try { interpreter?.close() } finally { interpreter = null }
+    }
 
-        // We expect [1, N, attrs]; grab the N rows.
-        val rows = out[0]
-        val results = ArrayList<DetectionResult>(rows.size)
+    private fun loadModelFromAssets(context: Context, assetName: String): MappedByteBuffer {
+        val afd = context.assets.openFd(assetName)
+        FileInputStream(afd.fileDescriptor).channel.use { ch ->
+            return ch.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+        }
+    }
 
-        val numClasses = classNames.size
+    fun autoOrientAndResize(src: Bitmap): Bitmap {
+        val base = if (src.config != Bitmap.Config.ARGB_8888) {
+            src.copy(Bitmap.Config.ARGB_8888, false)
+        } else src
+        if (base.width == INPUT_SIZE && base.height == INPUT_SIZE) return base
+        return Bitmap.createScaledBitmap(base, INPUT_SIZE, INPUT_SIZE, true)
+    }
 
-        for (r in rows) {
-            // 1) Guard against malformed rows
-            if (r.size < 5 + numClasses) continue
+    // ---------- Parsing & NMS ----------
 
-            // 2) Read box center/size (already normalized). Clamp to keep within [0,1].
-            val x = r[0].coerceIn(0f, 1f)
-            val y = r[1].coerceIn(0f, 1f)
-            // Ensure width/height are finite and non-zero to avoid degenerate boxes.
-            val w = if (r[2].isFinite()) r[2].coerceAtLeast(1e-6f).coerceAtMost(1f) else continue
-            val h = if (r[3].isFinite()) r[3].coerceAtLeast(1e-6f).coerceAtMost(1f) else continue
+    private fun iou(a: DetectionResult, b: DetectionResult): Float {
+        val ax1 = a.xCenter - 0.5f * a.width
+        val ay1 = a.yCenter - 0.5f * a.height
+        val ax2 = a.xCenter + 0.5f * a.width
+        val ay2 = a.yCenter + 0.5f * a.height
 
-            // 3) Objectness score (already a probability). Clamp to [0,1].
-            val obj = if (r[4].isFinite()) r[4].coerceIn(0f, 1f) else 0f
+        val bx1 = b.xCenter - 0.5f * b.width
+        val by1 = b.yCenter - 0.5f * b.height
+        val bx2 = b.xCenter + 0.5f * b.width
+        val by2 = b.yCenter + 0.5f * b.height
 
-            // 4) Pick the best class robustly (avoid -1 by initializing with class 0)
-            var bestClass = 0
-            var bestProb = if (r[5].isFinite()) r[5].coerceIn(0f, 1f) else 0f
-            for (c in 1 until numClasses) {
-                val p = if (r[5 + c].isFinite()) r[5 + c].coerceIn(0f, 1f) else 0f
-                if (p >= bestProb) {            // >= so we always end with a valid class
-                    bestProb = p
-                    bestClass = c
+        val x1 = maxOf(ax1, bx1)
+        val y1 = maxOf(ay1, by1)
+        val x2 = minOf(ax2, bx2)
+        val y2 = minOf(ay2, by2)
+
+        val iw = (x2 - x1).coerceAtLeast(0f)
+        val ih = (y2 - y1).coerceAtLeast(0f)
+        val inter = iw * ih
+        val areaA = (ax2 - ax1).coerceAtLeast(0f) * (ay2 - ay1).coerceAtLeast(0f)
+        val areaB = (bx2 - bx1).coerceAtLeast(0f) * (by2 - by1).coerceAtLeast(0f)
+        val denom = areaA + areaB - inter
+        return if (denom > 0f) inter / denom else 0f
+    }
+
+    private val labels = arrayOf("1010", "1001", "1000")
+
+    fun classNameForId(id: Int): String =
+        if (id in labels.indices) labels[id] else "Class_$id"
+
+    fun getConfidence(det: DetectionResult): Float = det.confidence
+
+    fun selectTopPerClass(dets: List<DetectionResult>, keepPerClass: Int = 1): List<DetectionResult> {
+        if (keepPerClass <= 0 || dets.isEmpty()) return dets
+        return dets.groupBy { it.classId }
+            .values
+            .flatMap { it.sortedByDescending { d -> d.confidence }.take(keepPerClass) }
+    }
+
+    /**
+     * Accepts YOLO head output in either layout:
+     *  - [1, 84, 8400] (CHW)  => access [0][channel][anchor]
+     *  - [1, 8400, 84] (HWC)  => access [0][anchor][channel]
+     *
+     * Channels are: [x, y, w, h, obj, class0, class1, ...]
+     * (x,y,w,h) may be normalized or in pixels; we normalize to 0..1 if needed.
+     */
+    fun parseTFLite(
+        raw: Array<Array<FloatArray>>,
+        confidenceThreshold: Float,
+        classAgnosticNms: Boolean,
+        multiLabelPerBox: Boolean
+    ): List<DetectionResult> {
+
+        val b = raw[0]
+        val d1 = b.size
+        val d2 = b[0].size
+
+        val channels: Int
+        val numPoints: Int
+        val get: (c: Int, i: Int) -> Float
+
+        // Detect layout
+        if (d1 <= 10 && d2 >= d1) {
+            // [1, 84, 8400] style
+            channels = d1
+            numPoints = d2
+            get = { c, i -> b[c][i] }
+        } else {
+            // [1, 8400, 84] style
+            channels = d2
+            numPoints = d1
+            get = { c, i -> b[i][c] }
+        }
+
+        val nClasses = (channels - 5).coerceAtLeast(0)
+        val candidates = ArrayList<DetectionResult>(numPoints * (if (multiLabelPerBox) 2 else 1))
+
+        for (i in 0 until numPoints) {
+            val x = get(0, i)
+            val y = get(1, i)
+            val w = get(2, i)
+            val h = get(3, i)
+            val obj = get(4, i)
+
+            // Heuristic: convert to normalized if values look like pixels
+            val cxN = if (x > 1.5f) x / INPUT_SIZE else x
+            val cyN = if (y > 1.5f) y / INPUT_SIZE else y
+            val wN  = if (w > 1.5f) w / INPUT_SIZE else w
+            val hN  = if (h > 1.5f) h / INPUT_SIZE else h
+
+            if (nClasses > 0) {
+                if (multiLabelPerBox) {
+                    for (c in 0 until nClasses) {
+                        val clsP = get(5 + c, i)
+                        val conf = obj * clsP
+                        if (conf >= confidenceThreshold) {
+                            candidates.add(
+                                DetectionResult(
+                                    xCenter = cxN.coerceIn(0f, 1f),
+                                    yCenter = cyN.coerceIn(0f, 1f),
+                                    width = wN.coerceIn(0f, 1f),
+                                    height = hN.coerceIn(0f, 1f),
+                                    confidence = conf,
+                                    classId = c
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    var bestC = 0
+                    var bestP = get(5, i)
+                    for (c in 1 until nClasses) {
+                        val p = get(5 + c, i)
+                        if (p > bestP) { bestP = p; bestC = c }
+                    }
+                    val conf = obj * bestP
+                    if (conf >= confidenceThreshold) {
+                        candidates.add(
+                            DetectionResult(
+                                xCenter = cxN.coerceIn(0f, 1f),
+                                yCenter = cyN.coerceIn(0f, 1f),
+                                width = wN.coerceIn(0f, 1f),
+                                height = hN.coerceIn(0f, 1f),
+                                confidence = conf,
+                                classId = bestC
+                            )
+                        )
+                    }
                 }
-            }
-
-            // 5) Final confidence = objectness * best class prob (stay in [0,1])
-            val conf = (obj * bestProb).coerceIn(0f, 1f)
-
-            // 6) Threshold and append as a DetectionResult
-            if (conf >= Settings.Inference.confidenceThreshold) {
-                results.add(
-                    DetectionResult(
-                        xCenter = x,
-                        yCenter = y,
-                        width = w,
-                        height = h,
-                        confidence = conf,
-                        classId = bestClass
+            } else {
+                // Class-agnostic model
+                if (obj >= confidenceThreshold) {
+                    candidates.add(
+                        DetectionResult(
+                            xCenter = cxN.coerceIn(0f, 1f),
+                            yCenter = cyN.coerceIn(0f, 1f),
+                            width = wN.coerceIn(0f, 1f),
+                            height = hN.coerceIn(0f, 1f),
+                            confidence = obj,
+                            classId = 0
+                        )
                     )
-                )
+                }
             }
         }
 
-        // 7) Light, class-agnostic NMS to clean up duplicates
-        return nms(results, iouThreshold = 0.45f, maxKeep = 100)
-    }
+        if (candidates.isEmpty()) return emptyList()
 
-    // ---- NMS (class-agnostic) on center-format boxes normalized to [0..1] ----
-    private fun nms(dets: List<DetectionResult>, iouThreshold: Float, maxKeep: Int): List<DetectionResult> {
-        if (dets.isEmpty()) return emptyList()
-        val sorted = dets.sortedByDescending { it.confidence }.toMutableList()
-        val kept = ArrayList<DetectionResult>(min(maxKeep, sorted.size))
+        // --- NMS ---
+        val iouThresh = Settings.Inference.iouThreshold
+        candidates.sortByDescending { it.confidence }
+        val kept = ArrayList<DetectionResult>(candidates.size)
+        val removed = BooleanArray(candidates.size)
 
-        while (sorted.isNotEmpty() && kept.size < maxKeep) {
-            val best = sorted.removeAt(0)
-            kept.add(best)
-
-            val it = sorted.iterator()
-            while (it.hasNext()) {
-                val other = it.next()
-                if (iou(best, other) > iouThreshold) it.remove()
+        for (i in candidates.indices) {
+            if (removed[i]) continue
+            val a = candidates[i]
+            kept.add(a)
+            for (j in i + 1 until candidates.size) {
+                if (removed[j]) continue
+                val bDet = candidates[j]
+                if (!classAgnosticNms && a.classId != bDet.classId) continue
+                if (iou(a, bDet) > iouThresh) removed[j] = true
             }
         }
         return kept
-    }
-
-    private fun toCorners(d: DetectionResult): FloatArray {
-        val x1 = d.xCenter - d.width / 2f
-        val y1 = d.yCenter - d.height / 2f
-        val x2 = d.xCenter + d.width / 2f
-        val y2 = d.yCenter + d.height / 2f
-        return floatArrayOf(x1, y1, x2, y2)
-    }
-
-    private fun iou(a: DetectionResult, b: DetectionResult): Float {
-        val ra = toCorners(a)
-        val rb = toCorners(b)
-        val x1 = max(ra[0], rb[0])
-        val y1 = max(ra[1], rb[1])
-        val x2 = min(ra[2], rb[2])
-        val y2 = min(ra[3], rb[3])
-        val interW = max(0f, x2 - x1)
-        val interH = max(0f, y2 - y1)
-        val inter = interW * interH
-        val areaA = (ra[2] - ra[0]).coerceAtLeast(0f) * (ra[3] - ra[1]).coerceAtLeast(0f)
-        val areaB = (rb[2] - rb[0]).coerceAtLeast(0f) * (rb[3] - rb[1]).coerceAtLeast(0f)
-        val union = areaA + areaB - inter
-        return if (union <= 0f) 0f else inter / union
-    }
-
-    // ---- Rescale: letterboxed -> original image coordinates (center + radius) ----
-    /**
-     * @param det detection in normalized letterboxed space [0..1]
-     * @param rawW/H original bitmap size (NOT letterboxed)
-     * @param offsets (left, top) returned by createLetterboxedBitmap
-     * @param inputW/H model input (letterboxed) size
-     */
-    fun rescaleToCenterAndRadius(
-        det: DetectionResult,
-        rawW: Int,
-        rawH: Int,
-        offsets: Pair<Int, Int>,
-        inputW: Int,
-        inputH: Int
-    ): Pair<Point, Int> {
-        val (left, top) = offsets
-
-        // position/size on the letterboxed canvas (in px)
-        val xLb = det.xCenter * inputW
-        val yLb = det.yCenter * inputH
-        val rLb = 0.5f * min(det.width * inputW, det.height * inputH)
-
-        // how original image was scaled to fit input
-        val scale = min(inputW.toFloat() / rawW, inputH.toFloat() / rawH)
-
-        // invert letterbox transform
-        val xRaw = (xLb - left) / scale
-        val yRaw = (yLb - top) / scale
-        val rRaw = (rLb / scale)
-
-        return Point(xRaw.toDouble(), yRaw.toDouble()) to rRaw.toInt()
     }
 }

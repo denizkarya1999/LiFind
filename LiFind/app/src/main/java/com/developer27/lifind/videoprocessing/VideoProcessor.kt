@@ -1,50 +1,32 @@
 package com.developer27.lifind.videoprocessing
 
-import Trilateration
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
-import org.opencv.core.Mat
-import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
-import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.image.TensorImage
-import java.io.File
-import java.io.FileWriter
-import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
-data class DrawInfo(val x1: Int, val y1: Int, val x2: Int, val y2: Int, val label: String)
-
-private fun Float.format(digits: Int) = "%.${digits}f".format(this)
-
-// Holds the last set of LED distances: (classId, distance)
-private var lastLedDistances: List<Pair<Int, Double>> = emptyList()
-
-// Holds the last centers of each detected LED: (classId, centerPoint)
-private var lastLedCenters: List<Pair<Int, Point>> = emptyList()
-
-// Holds the last trilaterated user position
-private var lastUserPosition: Pair<Double, Double> = 0.0 to 0.0
+// ----------------- Data / Settings -----------------
 
 data class DetectionResult(
-    val xCenter: Float,
-    val yCenter: Float,
-    val width: Float,
-    val height: Float,
+    val xCenter: Float,   // normalized 0..1
+    val yCenter: Float,   // normalized 0..1
+    val width: Float,     // normalized 0..1
+    val height: Float,    // normalized 0..1
     val confidence: Float,
     val classId: Int
 )
-
-var distanceInterpreter: Interpreter? = null
 
 object Settings {
     object DetectionMode {
@@ -53,196 +35,209 @@ object Settings {
     }
     object Inference {
         var confidenceThreshold: Float = 0.00f
+        var iouThreshold: Float = 0.45f
+        var classAgnosticNms: Boolean = true
+        var multiLabelPerBox: Boolean = true
+        var topPerClass: Int = 1
     }
     object BoundingBox {
         var enableBoundingBox = true
-        var boxColor = Scalar(255.0, 255.0, 255.0)
+
+        // BGR palette for OpenCV
+        val perClassColors: Array<Scalar> = arrayOf(
+            Scalar(0.0, 0.0, 255.0), // class 0 -> Red
+            Scalar(0.0, 255.0, 0.0), // class 1 -> Green
+            Scalar(255.0, 0.0, 0.0)  // class 2 -> Blue
+        )
         var boxThickness = 2
+        val fallbackBoxColor = Scalar(255.0, 255.0, 255.0)
+        var drawCenterDot = false
     }
 }
 
+/**
+ * Frame processor optimized to:
+ *  - Reuse CoroutineScope, TensorImage, output arrays, Mat, Bitmaps
+ *  - Avoid allocations in hot loops
+ *  - Guard OpenCV init
+ */
 class VideoProcessor(private val context: Context) {
-    // Accessors
-    fun getLastLedDistances(): List<Pair<Int, Double>> = lastLedDistances
-    fun getLastLedCenters(): List<Pair<Int, Point>> = lastLedCenters
-    fun getLastUserPosition(): Pair<Double, Double> = lastUserPosition
+
+    private val tag = "VideoProcessor"
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    // --- Reusable TFLite input/output holders ---
+    private val tensorImage = TensorImage(DataType.FLOAT32)
+
+    // interpreter output shape, default small placeholder until first run
+    private var outShape: IntArray = intArrayOf(1, 1, 8)
+
+    // Backing array reused per frame; resized when model output shape changes
+    @Volatile private var distOut: Array<Array<FloatArray>> =
+        arrayOf(arrayOf(FloatArray(8)))
+
+    // Reuse output bitmap to avoid realloc each frame
+    private var reusedOutBitmap: Bitmap? = null
+
+    // --- Reusable OpenCV buffers ---
+    // Create Mat only after the native lib is loaded
+    private lateinit var workMat: org.opencv.core.Mat
+
+    // Guard against OpenCV init crash loops
+    private val opencvLoaded = AtomicBoolean(false)
 
     init {
         try {
             System.loadLibrary("opencv_java4")
+            opencvLoaded.set(true)
+            workMat = org.opencv.core.Mat()   // SAFE: library is loaded now
         } catch (e: UnsatisfiedLinkError) {
-            Log.d("VideoProcessor", "OpenCV failed to load: ${e.message}", e)
+            Log.d(tag, "OpenCV failed to load: ${e.message}", e)
         }
     }
 
-    fun setDistanceInterpreter(model: Interpreter) = synchronized(this) {
-        distanceInterpreter = model
-        Log.d("VideoProcessor", "Distance Interpreter set")
+    fun close() {
+        scope.cancel()
+        workMat.release()
+        reusedOutBitmap = null
+        try { YOLOHelperV2.closeInterpreter() } catch (_: Throwable) {}
     }
 
     fun processFrame(bitmap: Bitmap, callback: (Pair<Bitmap, Bitmap>?) -> Unit) {
-        CoroutineScope(Dispatchers.Default).launch {
-            val result: Pair<Bitmap, Bitmap>? = try {
+        scope.launch {
+            val result = try {
                 when (Settings.DetectionMode.current) {
                     Settings.DetectionMode.Mode.YOLO -> processFrameInternalYOLO(bitmap)
                 }
             } catch (e: Exception) {
-                Log.d("VideoProcessor", "Error processing frame: ${e.message}", e)
+                Log.d(tag, "Error processing frame: ${e.message}", e)
                 null
             }
             withContext(Dispatchers.Main) { callback(result) }
         }
     }
 
+    private fun ensureOutputBuffers(interp: org.tensorflow.lite.Interpreter) {
+        val shape = interp.getOutputTensor(0).shape() // e.g. [1, 84, 8400] or [1, 8400, 84]
+        if (!shape.contentEquals(outShape)) {
+            outShape = shape
+            distOut = Array(shape[0]) { Array(shape[1]) { FloatArray(shape[2]) } }
+        }
+    }
+
+    private fun ensureReusedBitmaps() {
+        val w = YOLOHelperV2.INPUT_SIZE
+        val h = YOLOHelperV2.INPUT_SIZE
+        if (reusedOutBitmap == null ||
+            reusedOutBitmap!!.width != w ||
+            reusedOutBitmap!!.height != h ||
+            reusedOutBitmap!!.config != Bitmap.Config.ARGB_8888
+        ) {
+            reusedOutBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        }
+    }
+
     private suspend fun processFrameInternalYOLO(
         bitmap: Bitmap
-    ): Pair<Bitmap, Bitmap> = withContext(Dispatchers.IO) {
-        val tag = javaClass.simpleName
+    ): Pair<Bitmap, Bitmap>? = withContext(Dispatchers.Default) {
+        if (!opencvLoaded.get()) return@withContext null
 
-        val (inputW, inputH, outputShape) = getModelDimensions()
-        val (letterboxed, offsets) = YOLOHelper.createLetterboxedBitmap(bitmap, inputW, inputH)
-        val tensorImage = TensorImage(DataType.FLOAT32).apply { load(letterboxed) }
+        // 1) Auto-orient + resize to 640×640 ARGB_8888
+        val inputBitmap = YOLOHelperV2.autoOrientAndResize(bitmap)
+        ensureReusedBitmaps()
 
-        // We'll draw on the letterboxed Mat, since that's what we feed the model
-        val m = Mat().also { Utils.bitmapToMat(letterboxed, it) }
+        // 2) Prepare TFLite input (reused TensorImage)
+        tensorImage.load(inputBitmap)
 
-        val ledDistancesList = mutableListOf<Pair<Int, Double>>()
-        val ledCentersList   = mutableListOf<Pair<Int, Point>>()
-
-        val interpreter = distanceInterpreter
-        if (interpreter == null) {
-            Log.w(tag, "Interpreter is null; returning original frame.")
-            val outBmp = Bitmap.createBitmap(letterboxed.width, letterboxed.height, letterboxed.config).also {
-                Utils.matToBitmap(m, it); m.release()
-            }
-            return@withContext outBmp to letterboxed
+        // 3) Run model (ensure interpreter + reusable output buffer)
+        val interp = YOLOHelperV2.ensureInterpreter(context)
+        ensureOutputBuffers(interp)
+        synchronized(interp) {
+            interp.run(tensorImage.buffer, distOut)
         }
 
-        // Run model
-        val distOut = Array(outputShape[0]) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
-        interpreter.run(tensorImage.buffer, distOut)
+        // 4) Parse + NMS + optional per-class top-K
+        val rawDetections = YOLOHelperV2.parseTFLite(
+            raw = distOut,
+            confidenceThreshold = Settings.Inference.confidenceThreshold,
+            classAgnosticNms = Settings.Inference.classAgnosticNms,
+            multiLabelPerBox = Settings.Inference.multiLabelPerBox
+        )
+        val dets =
+            if (Settings.Inference.topPerClass > 0)
+                YOLOHelperV2.selectTopPerClass(rawDetections, Settings.Inference.topPerClass)
+            else rawDetections
 
-        // Parse -> keep best per LED id -> cap to 3
-        val bestPerLed = YOLOHelper.parseTFLite(distOut)
-            ?.filter { it.confidence >= Settings.Inference.confidenceThreshold }
-            ?.groupBy { det -> YOLOHelper.classNameForId(det.classId).substringBefore('_').toInt() }
-            ?.map { (_, dets) -> dets.maxByOrNull { it.confidence }!! }
-            ?: emptyList()
+        // 5) Draw
+        Utils.bitmapToMat(inputBitmap, workMat)
+        if (Settings.BoundingBox.enableBoundingBox && dets.isNotEmpty()) {
+            val size = YOLOHelperV2.INPUT_SIZE.toFloat()
+            val right = (size - 1).toInt()
+            val bottom = (size - 1).toInt()
 
-        Log.d(tag, "Detections after grouping: ${bestPerLed.size}")
+            var xLb: Float; var yLb: Float; var wLb: Float; var hLb: Float
+            var x1: Int; var y1: Int; var x2: Int; var y2: Int
+            var color: Scalar
+            var confPct: Int
+            val labelBuf = StringBuilder(32)
 
-        val selected = bestPerLed
-            .sortedByDescending { it.confidence }
-            .take(3)
-            .sortedBy { det -> YOLOHelper.classNameForId(det.classId).substringBefore('_').toInt() }
+            for (i in dets.indices) {
+                val det = dets[i]
 
-        val boxesToDraw = mutableListOf<DrawInfo>()
+                xLb = det.xCenter * size
+                yLb = det.yCenter * size
+                wLb = det.width  * size
+                hLb = det.height * size
 
-        selected.forEach { det ->
-            val parts    = YOLOHelper.classNameForId(det.classId).split('_')
-            val ledId    = parts[0].toInt()
-            val distance = parts[1].toDouble()
+                x1 = (xLb - 0.5f * wLb).toInt().coerceIn(0, right)
+                y1 = (yLb - 0.5f * hLb).toInt().coerceIn(0, bottom)
+                x2 = (xLb + 0.5f * wLb).toInt().coerceIn(0, right)
+                y2 = (yLb + 0.5f * hLb).toInt().coerceIn(0, bottom)
 
-            // Letterboxed coords (for drawing later)
-            val xLb = det.xCenter * inputW
-            val yLb = det.yCenter * inputH
-            val wLb = det.width  * inputW
-            val hLb = det.height * inputH
+                confPct = (YOLOHelperV2.getConfidence(det) * 100f + 0.5f).toInt()
+                labelBuf.clear()
+                labelBuf.append("OOK ")
+                    .append(YOLOHelperV2.classNameForId(det.classId))
+                    .append(' ')
+                    .append(confPct)
+                    .append('%')
 
-            // Original coords (for logging/trilateration)
-            val (centerRaw, _) = YOLOHelper.rescaleToCenterAndRadius(
-                det, bitmap.width, bitmap.height, offsets, inputW, inputH
-            )
+                color = Settings.BoundingBox.perClassColors.getOrNull(det.classId)
+                    ?: Settings.BoundingBox.fallbackBoxColor
 
-            // Log in original coords
-            val classLabel = YOLOHelper.classNameForId(det.classId)
-            Log.d(tag, "$classLabel: x=${centerRaw.x.toFloat().format(2)}, y=${centerRaw.y.toFloat().format(2)}")
-
-            // Store for trilateration
-            ledCentersList.add(ledId to centerRaw)
-            ledDistancesList.add(ledId to distance)
-
-            // Prepare draw info (Int px on the letterboxed canvas)
-            val x1 = (xLb - wLb * 0.5f).toInt().coerceIn(0, inputW - 1)
-            val y1 = (yLb - hLb * 0.5f).toInt().coerceIn(0, inputH - 1)
-            val x2 = (xLb + wLb * 0.5f).toInt().coerceIn(0, inputW - 1)
-            val y2 = (yLb + hLb * 0.5f).toInt().coerceIn(0, inputH - 1)
-            boxesToDraw += DrawInfo(
-                x1, y1, x2, y2,
-                "LED = $ledId | Dist. = $distance"
-            )
-
-            // Keep for trilateration (original coords)
-            ledCentersList.add(ledId to centerRaw)
-            ledDistancesList.add(ledId to distance)
-        }
-
-        // === After all detections are processed, draw once (up to 3) ===
-        if (Settings.BoundingBox.enableBoundingBox) {
-            boxesToDraw.forEach { b ->
                 Imgproc.rectangle(
-                    m,
-                    Point(b.x1.toDouble(), b.y1.toDouble()),
-                    Point(b.x2.toDouble(), b.y2.toDouble()),
-                    Settings.BoundingBox.boxColor,
+                    workMat,
+                    org.opencv.core.Point(x1.toDouble(), y1.toDouble()),
+                    org.opencv.core.Point(x2.toDouble(), y2.toDouble()),
+                    color,
                     max(2, Settings.BoundingBox.boxThickness),
                     Imgproc.LINE_AA,
                     0
                 )
+
                 Imgproc.putText(
-                    m,
-                    b.label,
-                    Point(b.x1.toDouble(), (b.y1 - 6).coerceAtLeast(10).toDouble()),
+                    workMat,
+                    labelBuf.toString(),
+                    org.opencv.core.Point(x1.toDouble(), (y1 - 6).coerceAtLeast(10).toDouble()),
                     Imgproc.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    Settings.BoundingBox.boxColor,
-                    2,
-                    Imgproc.LINE_AA,
-                    false
+                    0.7, color, 2, Imgproc.LINE_AA, false
                 )
+
+                if (Settings.BoundingBox.drawCenterDot) {
+                    Imgproc.circle(
+                        workMat,
+                        org.opencv.core.Point(xLb.toDouble(), yLb.toDouble()),
+                        3, color, Imgproc.FILLED
+                    )
+                }
             }
         }
 
-        // Trilaterate user position if we have 3
-        lastLedDistances = ledDistancesList.sortedBy { it.first }.take(3)
-        lastLedCenters   = ledCentersList.sortedBy { it.first }.take(3)
-        lastUserPosition = if (lastLedDistances.size == 3) {
-            val (dA, dB, dC) = lastLedDistances.map { it.second }
-            Trilateration.solve(dA, dB, dC)
-        } else 0.0 to 0.0
+        // 6) Convert Mat back to bitmap(s)
+        val annotated = reusedOutBitmap!!
+        Utils.matToBitmap(workMat, annotated)
 
-        Log.d(tag, "User position: x=${lastUserPosition.first}, y=${lastUserPosition.second}")
-
-        // (Optional) write user position to a file (kept from your original)
-        try {
-            val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-            if (!docsDir.exists() && !docsDir.mkdirs()) {
-                Log.e(tag, "Failed to create Documents directory")
-            }
-            val logFile = File(docsDir, "LiFind_Log.txt")
-            if (logFile.exists()) logFile.delete()
-            FileWriter(logFile, false).use { writer ->
-                writer.append("UserPosition: x=${lastUserPosition.first}, y=${lastUserPosition.second}\n")
-            }
-            Log.d(tag, "Wrote user position to ${logFile.absolutePath}")
-        } catch (e: IOException) {
-            Log.e(tag, "Failed to write user position", e)
-        }
-
-        // Convert annotated Mat -> Bitmap to display
-        val outBmp = Bitmap.createBitmap(letterboxed.width, letterboxed.height, letterboxed.config).also {
-            Utils.matToBitmap(m, it); m.release()
-        }
-        outBmp to letterboxed
-    }
-
-    fun getModelDimensions(): Triple<Int, Int, List<Int>> {
-        val inTensor  = distanceInterpreter?.getInputTensor(0)
-        val shapeIn   = inTensor?.shape() // expected [1, H, W, 3]
-        val h         = shapeIn?.getOrNull(1) ?: 416
-        val w         = shapeIn?.getOrNull(2) ?: 416
-        val outTensor = distanceInterpreter?.getOutputTensor(0)
-        val shapeOut  = outTensor?.shape()?.toList() ?: listOf(1, 1, 9)
-        return Triple(w, h, shapeOut)
+        // Return (annotated, 640x640 input used for inference)
+        annotated to inputBitmap
     }
 }

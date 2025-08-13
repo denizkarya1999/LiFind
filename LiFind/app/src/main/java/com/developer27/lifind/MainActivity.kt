@@ -1,6 +1,5 @@
 package com.developer27.lifind
 
-import Trilateration
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
@@ -12,8 +11,6 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.preference.PreferenceManager
 import android.util.Log
 import android.util.SparseIntArray
@@ -24,13 +21,11 @@ import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
-import com.developer27.lifind.trilateration.MapActivity
 import com.developer27.lifind.videoprocessing.VideoProcessor
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
@@ -57,9 +52,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
     private lateinit var pickMediaLauncher: ActivityResultLauncher<String>
-
-    /** Stores last detected trilateration result for manual map display */
-    private var lastUserPosition: Pair<Double, Double>? = null
 
     companion object {
         private const val SETTINGS_REQUEST_CODE = 1
@@ -149,8 +141,6 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        loadDistanceModelOnStartupThreaded()
-
         cameraHelper.setupZoomControls()
         sharedPreferences.registerOnSharedPreferenceChangeListener { _, key ->
             if (key == "shutter_speed") {
@@ -158,43 +148,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // --- LIVE VIEW “View Map” button logic ---
         viewBinding.viewMapButton.setOnClickListener {
             Log.d("MainActivity", "View Map clicked")
-
-            // 1) Get trilaterated user position
-            val userX = lastUserPosition?.first ?: 0.0
-            val userY = lastUserPosition?.second ?: 0.0
-
-            // 2) Get raw LED centers from VideoProcessor
-            val centers = videoProcessor?.getLastLedCenters() ?: emptyList()
-            val ledIds = IntArray(centers.size)   { centers[it].first }
-            val ledXs  = FloatArray(centers.size) { centers[it].second.x.toFloat() }
-            val ledYs  = FloatArray(centers.size) { centers[it].second.y.toFloat() }
-
-            // 2a) Grab camera/preview dimensions
-            val camW = viewBinding.viewFinder.width
-            val camH = viewBinding.viewFinder.height
-
-            // 3) Pack into Intent
-            Intent(this, MapActivity::class.java).also { intent ->
-                intent.putExtra("userX",    userX)
-                intent.putExtra("userY",    userY)
-                intent.putExtra("ledIds",   ledIds)
-                intent.putExtra("ledXs",    ledXs)
-                intent.putExtra("ledYs",    ledYs)
-                intent.putExtra("camWidth",  camW)
-                intent.putExtra("camHeight", camH)
-                startActivity(intent)
-            }
         }
 
-        // --- IMAGE PICKER logic (same pattern) ---
         viewBinding.uploadButton.setOnClickListener {
             pickMediaLauncher.launch("*/*")
         }
 
-        // --- UPLOAD BUTTON LOGIC ---
         pickMediaLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
             uri?.let { handlePickedMedia(it) }
         }
@@ -204,56 +165,16 @@ class MainActivity : AppCompatActivity() {
     private fun handlePickedMedia(uri: Uri) {
         val mimeType = contentResolver.getType(uri)
         if (mimeType?.startsWith("image") == true) {
-            // 1) Load bitmap
             val inputStream = contentResolver.openInputStream(uri)
             val bitmap = BitmapFactory.decodeStream(inputStream)
             inputStream?.close()
 
-            // 2) Process frame
             videoProcessor?.processFrame(bitmap) { processedFrames ->
                 processedFrames?.let { (outputBitmap, _) ->
                     viewBinding.processedFrameView.setImageBitmap(outputBitmap)
                     viewBinding.processedFrameView.visibility = View.VISIBLE
-
-                    // 3) Get your three distances
-                    val detections: List<Pair<Int, Double>> =
-                        videoProcessor?.getLastLedDistances() ?: emptyList()
-                    val DA = detections.getOrNull(0)?.second ?: 0.0
-                    val DB = detections.getOrNull(1)?.second ?: 0.0
-                    val DC = detections.getOrNull(2)?.second ?: 0.0
-
-                    if (DA > 0 && DB > 0 && DC > 0) {
-                        // 4) Trilaterate user X/Y
-                        val (x, y) = Trilateration.solve(DA, DB, DC)
-                        lastUserPosition = Pair(x, y)
-
-                        // 5) **NEW**: grab raw LED centers
-                        val centers = videoProcessor?.getLastLedCenters() ?: emptyList()
-                        val ledIds = IntArray(centers.size)   { centers[it].first }
-                        val ledXs  = FloatArray(centers.size) { centers[it].second.x.toFloat() }
-                        val ledYs  = FloatArray(centers.size) { centers[it].second.y.toFloat() }
-
-                        // 6) Build Intent with everything
-                        Intent(this, MapActivity::class.java).also { intent ->
-                            intent.putExtra("userX", x)
-                            intent.putExtra("userY", y)
-                            intent.putExtra("DA", DA)
-                            intent.putExtra("DB", DB)
-                            intent.putExtra("DC", DC)
-                            // pass the LED-center arrays
-                            intent.putExtra("ledIds", ledIds)
-                            intent.putExtra("ledXs",  ledXs)
-                            intent.putExtra("ledYs",  ledYs)
-                            startActivity(intent)
-                        }
-                    } else {
-                        Toast.makeText(this,
-                            "Could not detect all three LEDs!",
-                            Toast.LENGTH_LONG).show()
-                    }
                 }
             }
-
         } else if (mimeType?.startsWith("video") == true) {
             Toast.makeText(this,
                 "Video processing not implemented.",
@@ -272,41 +193,8 @@ class MainActivity : AppCompatActivity() {
         viewBinding.startProcessingButton.backgroundTintList =
             ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
-
-        // After 5 seconds, ask the user whether to launch MapActivity
-        Handler(Looper.getMainLooper()).postDelayed({
-            // 1) stop processing immediately
-            stopProcessingAndRecording()
-
-            AlertDialog.Builder(this)
-                .setTitle("Open Map?")
-                .setMessage("Do you want to view the map now?")
-                .setPositiveButton("Yes") { _, _ ->
-                    // Gather data and launch map
-                    val userX = lastUserPosition?.first ?: 0.0
-                    val userY = lastUserPosition?.second ?: 0.0
-                    val centers = videoProcessor?.getLastLedCenters() ?: emptyList()
-                    val ledIds = IntArray(centers.size)   { centers[it].first }
-                    val ledXs  = FloatArray(centers.size) { centers[it].second.x.toFloat() }
-                    val ledYs  = FloatArray(centers.size) { centers[it].second.y.toFloat() }
-                    val camW = viewBinding.viewFinder.width
-                    val camH = viewBinding.viewFinder.height
-
-                    Intent(this, MapActivity::class.java).also { intent ->
-                        intent.putExtra("userX",    userX)
-                        intent.putExtra("userY",    userY)
-                        intent.putExtra("ledIds",   ledIds)
-                        intent.putExtra("ledXs",    ledXs)
-                        intent.putExtra("ledYs",    ledYs)
-                        intent.putExtra("camWidth",  camW)
-                        intent.putExtra("camHeight", camH)
-                        startActivity(intent)
-                    }
-                }
-                .setNegativeButton("No", null)
-                .show()
-        }, 5000L)
     }
+
     private fun stopProcessingAndRecording() {
         isRecording = false
         isProcessing = false
@@ -319,10 +207,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processFrameWithVideoProcessor() {
+        val vp = videoProcessor ?: return
         if (isProcessingFrame) return
         val bitmap = viewBinding.viewFinder.bitmap ?: return
         isProcessingFrame = true
-        videoProcessor?.processFrame(bitmap) { processedFrames ->
+        vp.processFrame(bitmap) { processedFrames ->
             runOnUiThread {
                 processedFrames?.let { (outputBitmap, _) ->
                     if (isProcessing) {
@@ -331,79 +220,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 isProcessingFrame = false
             }
-        }
-    }
-
-    /** === New loader, only ever loads Distance_YOLOv8_float32.tflite ==== */
-    private fun loadDistanceModelOnStartupThreaded() {
-        Thread {
-            val modelFileName = "Distance_YOLOv8_float32.tflite"
-            val modelPath = copyAssetModelBlocking(modelFileName)
-            runOnUiThread {
-                if (modelPath.isEmpty()) {
-                    Toast.makeText(this,
-                        "Failed to copy or load $modelFileName",
-                        Toast.LENGTH_SHORT).show()
-                    return@runOnUiThread
-                }
-                try {
-                    val options = Interpreter.Options().apply {
-                        setNumThreads(Runtime.getRuntime().availableProcessors())
-                    }
-                    var delegateAdded = false
-                    try {
-                        options.addDelegate(NnApiDelegate()).also { delegateAdded = true }
-                        Log.d("MainActivity", "NNAPI delegate added.")
-                    } catch (_: Exception) { }
-                    if (!delegateAdded) {
-                        try {
-                            options.addDelegate(GpuDelegate())
-                            Log.d("MainActivity", "GPU delegate added.")
-                        } catch (_: Exception) { }
-                    }
-
-                    val mappedBuf = loadMappedFile(modelPath)
-                    val distanceInterp = Interpreter(mappedBuf, options)
-                    videoProcessor?.setDistanceInterpreter(distanceInterp)
-                    Log.d("MainActivity", "$modelFileName loaded into VideoProcessor")
-                } catch (e: Exception) {
-                    Toast.makeText(this,
-                        "Error loading model: ${e.message}",
-                        Toast.LENGTH_LONG).show()
-                    Log.e("MainActivity", "TFLite load error", e)
-                }
-            }
-        }.start()
-    }
-
-    /** Helper stays the same */
-    private fun loadMappedFile(modelPath: String): MappedByteBuffer {
-        val file = File(modelPath)
-        return file.inputStream()
-            .channel
-            .map(FileChannel.MapMode.READ_ONLY, 0, file.length())
-    }
-
-    private fun copyAssetModelBlocking(assetName: String): String {
-        return try {
-            val outFile = File(filesDir, assetName)
-            if (outFile.exists() && outFile.length() > 0) {
-                return outFile.absolutePath
-            }
-            assets.open(assetName).use { input ->
-                FileOutputStream(outFile).use { output ->
-                    val buffer = ByteArray(4 * 1024)
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                    }
-                    output.flush()
-                }
-            }
-            outFile.absolutePath
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error copying asset $assetName: ${e.message}")
-            ""
         }
     }
 
