@@ -23,7 +23,6 @@ import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import com.developer27.lifind.MainActivity
 import com.developer27.lifind.databinding.ActivityMainBinding
-import kotlin.math.max
 
 /**
  * CameraHelper is responsible for:
@@ -280,7 +279,6 @@ class CameraHelper(
     // Rolling shutter & exposure
     // ------------------------------------------------------------------------
     fun applyRollingShutter() {
-        // Decide if we can do manual or must do auto
         val cameraId = getCameraId()
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
 
@@ -298,24 +296,30 @@ class CameraHelper(
             return
         }
 
-        // If we can do manual, clamp to valid range
         val exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
 
         if (exposureTimeRange == null || isoRange == null) {
-            // fallback to auto if no valid range
             setAutoExposure()
             return
         }
 
         val safeExposureNs = shutterValueNs.coerceIn(exposureTimeRange.lower, exposureTimeRange.upper)
-        val safeISO = max(isoRange.lower, 100)
 
-        // fully manual
+        // Read ISO prefs
+        val manualIsoEnabled = sharedPreferences.getBoolean("manual_iso_enabled", true)
+        val isoFromPrefs = sharedPreferences.getString("iso_value", "800")?.toIntOrNull() ?: 800
+        val safeISO = isoFromPrefs.coerceIn(isoRange.lower, isoRange.upper)
+
+        // Fully manual exposure; if manual ISO disabled, we still must set *some* ISO because AE is off.
+        // Choose either the user ISO or a mid-range fallback.
+        val isoToUse = if (manualIsoEnabled) safeISO else
+            ((isoRange.lower + isoRange.upper) / 2).coerceIn(isoRange.lower, isoRange.upper)
+
         captureRequestBuilder?.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF)
         captureRequestBuilder?.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
         captureRequestBuilder?.set(CaptureRequest.SENSOR_EXPOSURE_TIME, safeExposureNs)
-        captureRequestBuilder?.set(CaptureRequest.SENSOR_SENSITIVITY, safeISO)
+        captureRequestBuilder?.set(CaptureRequest.SENSOR_SENSITIVITY, isoToUse)
     }
 
     private fun setAutoExposure() {
