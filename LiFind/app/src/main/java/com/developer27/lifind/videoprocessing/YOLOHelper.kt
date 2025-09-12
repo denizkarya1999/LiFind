@@ -17,9 +17,10 @@ import java.nio.channels.FileChannel
 object YOLOHelperV2 {
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_led_100_iso_model.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_iso_100_yolo_11s.tflite"
 
-    @Volatile private var interpreter: Interpreter? = null
+    @Volatile
+    private var interpreter: Interpreter? = null
 
     @Synchronized
     fun ensureInterpreter(context: Context): Interpreter {
@@ -36,7 +37,11 @@ object YOLOHelperV2 {
     }
 
     fun closeInterpreter() {
-        try { interpreter?.close() } finally { interpreter = null }
+        try {
+            interpreter?.close()
+        } finally {
+            interpreter = null
+        }
     }
 
     private fun loadModelFromAssets(context: Context, assetName: String): MappedByteBuffer {
@@ -88,7 +93,10 @@ object YOLOHelperV2 {
 
     fun getConfidence(det: DetectionResult): Float = det.confidence
 
-    fun selectTopPerClass(dets: List<DetectionResult>, keepPerClass: Int = 1): List<DetectionResult> {
+    fun selectTopPerClass(
+        dets: List<DetectionResult>,
+        keepPerClass: Int = 1
+    ): List<DetectionResult> {
         if (keepPerClass <= 0 || dets.isEmpty()) return dets
         return dets.groupBy { it.classId }
             .values
@@ -96,18 +104,22 @@ object YOLOHelperV2 {
     }
 
     /**
-     * Accepts YOLO head output in either layout:
-     *  - [1, 84, 8400] (CHW)  => access [0][channel][anchor]
-     *  - [1, 8400, 84] (HWC)  => access [0][anchor][channel]
+     * Robust YOLO TFLite parser that supports heads with or without an "obj" column.
      *
-     * Channels are: [x, y, w, h, obj, class0, class1, ...]
-     * (x,y,w,h) may be normalized or in pixels; we normalize to 0..1 if needed.
+     * expectedClasses: how many classes your model has (e.g., 3)
+     * hasObjectness:   true if layout is [x,y,w,h,obj,classes...], false if [x,y,w,h,classes...]
+     */
+    /**
+     * Robust YOLO TFLite parser that supports heads with or without an "obj" column.
+     *
+     * expectedClasses: how many classes your model has (e.g., 3)
      */
     fun parseTFLite(
         raw: Array<Array<FloatArray>>,
         confidenceThreshold: Float,
         classAgnosticNms: Boolean,
-        multiLabelPerBox: Boolean
+        multiLabelPerBox: Boolean,
+        expectedClasses: Int
     ): List<DetectionResult> {
 
         val b = raw[0]
@@ -118,20 +130,31 @@ object YOLOHelperV2 {
         val numPoints: Int
         val get: (c: Int, i: Int) -> Float
 
-        // Detect layout
-        if (d1 <= 10 && d2 >= d1) {
-            // [1, 84, 8400] style
+        // Layout detect: CHW [1,C,N] vs HWC [1,N,C]
+        if (d1 <= 10 && d2 >= d1) { // CHW
             channels = d1
             numPoints = d2
             get = { c, i -> b[c][i] }
-        } else {
-            // [1, 8400, 84] style
+        } else {                    // HWC
             channels = d2
             numPoints = d1
             get = { c, i -> b[i][c] }
         }
 
-        val nClasses = (channels - 5).coerceAtLeast(0)
+        // Auto-detect objectness
+        val hasObjectness = when (channels) {
+            4 + expectedClasses -> false
+            5 + expectedClasses -> true
+            else -> {
+                android.util.Log.e(
+                    "YOLOParser",
+                    "Unexpected head width=$channels (expected 4+K or 5+K with K=$expectedClasses)"
+                )
+                return emptyList()
+            }
+        }
+
+        val clsStart = if (hasObjectness) 5 else 4
         val candidates = ArrayList<DetectionResult>(numPoints * (if (multiLabelPerBox) 2 else 1))
 
         for (i in 0 until numPoints) {
@@ -139,40 +162,18 @@ object YOLOHelperV2 {
             val y = get(1, i)
             val w = get(2, i)
             val h = get(3, i)
-            val obj = get(4, i)
+            val obj = if (hasObjectness) get(4, i) else 1f
 
-            // Heuristic: convert to normalized if values look like pixels
+            // Normalize boxes if they look like pixels
             val cxN = if (x > 1.5f) x / INPUT_SIZE else x
             val cyN = if (y > 1.5f) y / INPUT_SIZE else y
-            val wN  = if (w > 1.5f) w / INPUT_SIZE else w
-            val hN  = if (h > 1.5f) h / INPUT_SIZE else h
+            val wN = if (w > 1.5f) w / INPUT_SIZE else w
+            val hN = if (h > 1.5f) h / INPUT_SIZE else h
 
-            if (nClasses > 0) {
-                if (multiLabelPerBox) {
-                    for (c in 0 until nClasses) {
-                        val clsP = get(5 + c, i)
-                        val conf = obj * clsP
-                        if (conf >= confidenceThreshold) {
-                            candidates.add(
-                                DetectionResult(
-                                    xCenter = cxN.coerceIn(0f, 1f),
-                                    yCenter = cyN.coerceIn(0f, 1f),
-                                    width = wN.coerceIn(0f, 1f),
-                                    height = hN.coerceIn(0f, 1f),
-                                    confidence = conf,
-                                    classId = c
-                                )
-                            )
-                        }
-                    }
-                } else {
-                    var bestC = 0
-                    var bestP = get(5, i)
-                    for (c in 1 until nClasses) {
-                        val p = get(5 + c, i)
-                        if (p > bestP) { bestP = p; bestC = c }
-                    }
-                    val conf = obj * bestP
+            if (multiLabelPerBox) {
+                for (c in 0 until expectedClasses) {
+                    val clsP = get(clsStart + c, i)
+                    val conf = if (hasObjectness) obj * clsP else clsP
                     if (conf >= confidenceThreshold) {
                         candidates.add(
                             DetectionResult(
@@ -181,22 +182,30 @@ object YOLOHelperV2 {
                                 width = wN.coerceIn(0f, 1f),
                                 height = hN.coerceIn(0f, 1f),
                                 confidence = conf,
-                                classId = bestC
+                                classId = c
                             )
                         )
                     }
                 }
             } else {
-                // Class-agnostic model
-                if (obj >= confidenceThreshold) {
+                var bestC = 0
+                var bestP = get(clsStart, i)
+                for (c in 1 until expectedClasses) {
+                    val p = get(clsStart + c, i)
+                    if (p > bestP) {
+                        bestP = p; bestC = c
+                    }
+                }
+                val conf = if (hasObjectness) obj * bestP else bestP
+                if (conf >= confidenceThreshold) {
                     candidates.add(
                         DetectionResult(
                             xCenter = cxN.coerceIn(0f, 1f),
                             yCenter = cyN.coerceIn(0f, 1f),
                             width = wN.coerceIn(0f, 1f),
                             height = hN.coerceIn(0f, 1f),
-                            confidence = obj,
-                            classId = 0
+                            confidence = conf,
+                            classId = bestC
                         )
                     )
                 }
@@ -205,23 +214,69 @@ object YOLOHelperV2 {
 
         if (candidates.isEmpty()) return emptyList()
 
-        // --- NMS ---
+        // NMS (class-agnostic or per-class)
         val iouThresh = Settings.Inference.iouThreshold
         candidates.sortByDescending { it.confidence }
         val kept = ArrayList<DetectionResult>(candidates.size)
         val removed = BooleanArray(candidates.size)
-
         for (i in candidates.indices) {
-            if (removed[i]) continue
+            if (removed[i])
+                continue
             val a = candidates[i]
             kept.add(a)
             for (j in i + 1 until candidates.size) {
                 if (removed[j]) continue
                 val bDet = candidates[j]
-                if (!classAgnosticNms && a.classId != bDet.classId) continue
-                if (iou(a, bDet) > iouThresh) removed[j] = true
+                if (!classAgnosticNms && a.classId != bDet.classId)
+                    continue
+                if (iou(a, bDet) > iouThresh)
+                    removed[j] = true
             }
         }
         return kept
+    }
+
+    // In YOLOHelperV2
+    fun maxPerClassScores(
+        raw: Array<Array<FloatArray>>,
+        expectedClasses: Int
+    ): FloatArray {
+        val b = raw[0]
+        val d1 = b.size
+        val d2 = b[0].size
+
+        val channels: Int
+        val numPoints: Int
+        val get: (c: Int, i: Int) -> Float
+
+        // Layout detect: CHW [1,C,N] vs HWC [1,N,C]
+        if (d1 <= 10 && d2 >= d1) { // CHW
+            channels = d1
+            numPoints = d2
+            get = { c, i -> b[c][i] }
+        } else {                    // HWC
+            channels = d2
+            numPoints = d1
+            get = { c, i -> b[i][c] }
+        }
+
+        val hasObjectness = when (channels) {
+            4 + expectedClasses -> false
+            5 + expectedClasses -> true
+            else -> return FloatArray(expectedClasses) { 0f }
+        }
+
+        val clsStart = if (hasObjectness) 5 else 4
+        val scores = FloatArray(expectedClasses) { 0f }
+
+        for (i in 0 until numPoints) {
+            val obj = if (hasObjectness) get(4, i) else 1f
+            for (c in 0 until expectedClasses) {
+                val p = get(clsStart + c, i)
+                val conf = if (hasObjectness) obj * p else p
+                if (conf > scores[c]) scores[c] = conf
+            }
+        }
+        return scores
     }
 }

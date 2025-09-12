@@ -36,7 +36,7 @@ object Settings {
     object Inference {
         var confidenceThreshold: Float = 0.00f
         var iouThreshold: Float = 0.45f
-        var classAgnosticNms: Boolean = true
+        var classAgnosticNms: Boolean = false
         var multiLabelPerBox: Boolean = true
         var topPerClass: Int = 1
     }
@@ -161,7 +161,8 @@ class VideoProcessor(private val context: Context) {
             raw = distOut,
             confidenceThreshold = Settings.Inference.confidenceThreshold,
             classAgnosticNms = Settings.Inference.classAgnosticNms,
-            multiLabelPerBox = Settings.Inference.multiLabelPerBox
+            multiLabelPerBox = Settings.Inference.multiLabelPerBox,
+            expectedClasses = 3
         )
         val dets =
             if (Settings.Inference.topPerClass > 0)
@@ -196,9 +197,9 @@ class VideoProcessor(private val context: Context) {
 
                 confPct = (YOLOHelperV2.getConfidence(det) * 100f + 0.5f).toInt()
                 labelBuf.clear()
-                labelBuf.append("OOK ")
+                labelBuf.append("OOK: ")
                     .append(YOLOHelperV2.classNameForId(det.classId))
-                    .append(' ')
+                    .append(" - Acc: ")
                     .append(confPct)
                     .append('%')
 
