@@ -14,40 +14,43 @@ import org.opencv.core.Point
 import java.io.File
 
 class MapActivity : AppCompatActivity() {
+    // ----------------------------
+    // Class-level (global) vars
+    // ----------------------------
+    private var led1: Point = Point(0.0, 0.0)
+    private var led2: Point = Point(0.0, 0.0)
+    private var led3: Point = Point(0.0, 0.0)
+    private var distance: Double = 0.0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1) Locate the log file in public Documents
-        val docsDir = Environment
-            .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
         val logFile = File(docsDir, "LiFind_Log.txt")
 
-        // 2) Default to (0,0) if no entry found
-        var userX = 0.0
-        var userY = 0.0
-
-        // 3) Read only the UserPosition line
+        // Parse only the LED line
         if (logFile.exists()) {
             logFile.useLines { lines ->
-                lines.firstOrNull { it.startsWith("UserPosition:") }
-                    ?.let { line ->
-                        Regex("""UserPosition:\s*x=([\d\.\-]+),\s*y=([\d\.\-]+)""")
-                            .find(line)
-                            ?.destructured
-                            ?.let { (xStr, yStr) ->
-                                userX = xStr.toDoubleOrNull() ?: 0.0
-                                userY = yStr.toDoubleOrNull() ?: 0.0
-                            }
+                // Prefer the LAST occurrence in case there are multiple entries
+                val ledLine = lines.lastOrNull { it.contains("LED_1") }
+                ledLine?.let { line ->
+                    val ledRegex = Regex(
+                        """LED_1\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_2\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_3\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*DISTANCE:\s*([-\d.]+)"""
+                    )
+                    ledRegex.find(line)?.destructured?.let { (x1,y1,x2,y2,x3,y3,dist) ->
+                        led1 = Point(x1.toDoubleOrNull() ?: 0.0, y1.toDoubleOrNull() ?: 0.0)
+                        led2 = Point(x2.toDoubleOrNull() ?: 0.0, y2.toDoubleOrNull() ?: 0.0)
+                        led3 = Point(x3.toDoubleOrNull() ?: 0.0, y3.toDoubleOrNull() ?: 0.0)
+                        distance = dist.toDoubleOrNull() ?: 0.0
                     }
+                }
             }
         }
 
-        // 4) Build your MapGridView with only the user point
+        // No user position in the log → we won't set one
         val mapView = MapGridView(this).apply {
-            setUserPixelPosition(userX, userY)
-            // LEDs are fixed, so we don't call setDetectedPixelData()
+            setDetectedPixelData(listOf(led1, led2, led3), listOf(distance, distance, distance))
         }
-
         setContentView(mapView)
     }
 }
