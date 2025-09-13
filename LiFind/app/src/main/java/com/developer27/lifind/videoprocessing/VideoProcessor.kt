@@ -7,7 +7,6 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
@@ -109,13 +108,6 @@ class VideoProcessor(private val context: Context) {
         } catch (e: UnsatisfiedLinkError) {
             Log.d(tag, "OpenCV failed to load: ${e.message}", e)
         }
-    }
-
-    fun close() {
-        scope.cancel()
-        workMat.release()
-        reusedOutBitmap = null
-        try { YOLOLEDHelper.closeInterpreter() } catch (_: Throwable) {}
     }
 
     fun processFrame(bitmap: Bitmap, callback: (Pair<Bitmap, Bitmap>?) -> Unit) {

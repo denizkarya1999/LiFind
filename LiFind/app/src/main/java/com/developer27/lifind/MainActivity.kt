@@ -27,13 +27,6 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.videoprocessing.VideoProcessor
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.GpuDelegate
-import org.tensorflow.lite.nnapi.NnApiDelegate
-import java.io.File
-import java.io.FileOutputStream
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -41,7 +34,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: CameraManager
     private lateinit var cameraHelper: CameraHelper
     private var videoProcessor: VideoProcessor? = null
-    private var isRecording = false
     private var isProcessing = false
     private var isProcessingFrame = false
 
@@ -127,11 +119,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         viewBinding.startProcessingButton.setOnClickListener {
-            if (isRecording) {
-                stopProcessingAndRecording()
-            } else {
                 startProcessingAndRecording()
-            }
         }
 
         viewBinding.aboutButton.setOnClickListener {
@@ -187,7 +175,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startProcessingAndRecording() {
-        isRecording = true
         isProcessing = true
         viewBinding.startProcessingButton.text = "Stop Tracking"
         viewBinding.startProcessingButton.backgroundTintList =
@@ -196,7 +183,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopProcessingAndRecording() {
-        isRecording = false
         isProcessing = false
         viewBinding.startProcessingButton.text = "Start Tracking"
         viewBinding.startProcessingButton.backgroundTintList =
@@ -238,7 +224,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        if (isRecording) stopProcessingAndRecording()
         cameraHelper.closeCamera()
         cameraHelper.stopBackgroundThread()
         super.onPause()
