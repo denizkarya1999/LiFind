@@ -2,6 +2,7 @@ package com.developer27.lifind.videoprocessing
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -14,11 +15,14 @@ import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.support.image.TensorImage
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
 // ----------------- Data / Settings -----------------
-
 data class DetectionResult(
     val xCenter: Float,   // normalized 0..1
     val yCenter: Float,   // normalized 0..1
@@ -27,6 +31,17 @@ data class DetectionResult(
     val confidence: Float,
     val classId: Int
 )
+
+private data class LedDistanceSample(
+    val tMillis: Long,
+    val led1: Pair<Int, Int>?,  // (x,y) in 640×640 px
+    val led2: Pair<Int, Int>?,
+    val led3: Pair<Int, Int>?,
+    val distLabel: String?      // e.g., "Near" or "" if not detected
+)
+
+private val ledDistSamples = java.util.Collections.synchronizedList(mutableListOf<LedDistanceSample>())
+private fun resetLedDistLogBuffer() = ledDistSamples.clear()
 
 object Settings {
     object DetectionMode {
@@ -298,11 +313,79 @@ class VideoProcessor(private val context: Context) {
             }
         }
 
+        // After computing `ledDets` and optional `bestDistance`...
+        val nowMs = System.currentTimeMillis()
+
+        val ledCenters = arrayOfNulls<Pair<Int, Int>>(3)
+        run {
+            val size = YOLOLEDHelper.INPUT_SIZE.toFloat()
+            val right = (size - 1).toInt()
+            val bottom = (size - 1).toInt()
+
+            for (det in ledDets) {
+                val cls = det.classId
+                if (cls in 0..2 && ledCenters[cls] == null) {
+                    val cx = (det.xCenter * size).toInt().coerceIn(0, right)
+                    val cy = (det.yCenter * size).toInt().coerceIn(0, bottom)
+                    ledCenters[cls] = cx to cy
+                }
+            }
+        }
+
+        var distLabel: String? = null
+        bestDistance?.let { bd ->
+            distLabel = YOLODISTANCEHelper.classNameForId(bd.classId)
+        }
+
+        // Push one entry into buffer
+        ledDistSamples += LedDistanceSample(
+            tMillis = nowMs,
+            led1 = ledCenters[0],
+            led2 = ledCenters[1],
+            led3 = ledCenters[2],
+            distLabel = distLabel
+        )
+
         // 6) Convert Mat back to bitmap(s)
         val annotated = reusedOutBitmap!!
         Utils.matToBitmap(workMat, annotated)
 
         // Return (annotated, 640x640 input used for inference)
         annotated to inputBitmap
+    }
+
+    fun writeLedDistLogToFile(): File? {
+        fun fmt(pt: Pair<Int, Int>?): String =
+            pt?.let { "(x=${it.first}, y=${it.second})" } ?: "(x=N/A, y=N/A)"
+
+        val name = "LiFind_Log.txt"
+
+        // Public Documents dir
+        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        if (!docsDir.exists()) docsDir.mkdirs()
+
+        val outFile = File(docsDir, name)
+        try {
+            PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
+                synchronized(ledDistSamples) {
+                    // ✅ only take the last entry if it exists
+                    val s = ledDistSamples.lastOrNull()
+                    if (s != null) {
+                        val line =
+                            "LED_1 - ${fmt(s.led1)}, " +
+                                    "LED_2 - ${fmt(s.led2)}, " +
+                                    "LED_3 - ${fmt(s.led3)}, " +
+                                    "DISTANCE: ${s.distLabel ?: "N/A"}"
+                        out.println(line)
+                    }
+                }
+            }
+            return outFile
+        } catch (t: Throwable) {
+            Log.e("LedDistLogger", "Failed to write log", t)
+            return null
+        } finally {
+            resetLedDistLogBuffer()
+        }
     }
 }

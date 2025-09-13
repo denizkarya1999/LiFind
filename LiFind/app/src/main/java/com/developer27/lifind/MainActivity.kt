@@ -203,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             ContextCompat.getColorStateList(this, R.color.blue)
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.processedFrameView.setImageBitmap(null)
-        Toast.makeText(this, "Tracking stopped", Toast.LENGTH_LONG).show()
+        videoProcessor?.writeLedDistLogToFile()
     }
 
     private fun processFrameWithVideoProcessor() {
