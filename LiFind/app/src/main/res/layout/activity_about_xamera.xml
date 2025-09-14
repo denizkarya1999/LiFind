@@ -99,9 +99,9 @@
             android:id="@+id/textViewReleaseDate"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Release Date: August 15th 2025"
-            android:textColor="@color/darkBlue"
-            android:layout_marginTop="8dp" />
+            android:layout_marginTop="8dp"
+            android:text="Release Date: September 14th 2025"
+            android:textColor="@color/darkBlue" />
 
         <TextView
             android:id="@+id/textViewDevelopers"
