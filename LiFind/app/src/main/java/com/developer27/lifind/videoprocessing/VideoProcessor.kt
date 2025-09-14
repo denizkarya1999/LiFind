@@ -33,10 +33,12 @@ data class DetectionResult(
 
 private data class LedDistanceSample(
     val tMillis: Long,
-    val led1: Pair<Int, Int>?,  // (x,y) in 640×640 px
+    val led1: Pair<Int, Int>?,
     val led2: Pair<Int, Int>?,
     val led3: Pair<Int, Int>?,
-    val distLabels: List<String> // up to 3 distance class labels (e.g., ["Near","Mid","Far"])
+    val dist1Cm: Double?,   // distance matched to LED_1 (cm), or null
+    val dist2Cm: Double?,   // matched to LED_2
+    val dist3Cm: Double?    // matched to LED_3
 )
 
 private val ledDistSamples = java.util.Collections.synchronizedList(mutableListOf<LedDistanceSample>())
@@ -174,7 +176,6 @@ class VideoProcessor(private val context: Context) {
             multiLabelPerBox = Settings.Inference.multiLabelPerBox,
             expectedClasses = 3
         )
-
         val ledDets: List<DetectionResult> =
             if (Settings.Inference.topPerClass > 0)
                 YOLOLEDHelper.selectTopPerClass(rawLedDetections, Settings.Inference.topPerClass)
@@ -184,11 +185,9 @@ class VideoProcessor(private val context: Context) {
         val distInterp = YOLODISTANCEHelper.ensureInterpreter(context)
         val distShape = distInterp.getOutputTensor(0).shape() // e.g., [1,84,8400] or [1,8400,84]
         val distHead = Array(distShape[0]) { Array(distShape[1]) { FloatArray(distShape[2]) } }
-
         synchronized(distInterp) {
             distInterp.run(tensorImage.buffer, distHead)
         }
-
         val distDets: List<DetectionResult> =
             YOLODISTANCEHelper.parseTFLite(
                 raw = distHead,
@@ -200,24 +199,75 @@ class VideoProcessor(private val context: Context) {
                 .sortedByDescending { YOLODISTANCEHelper.getConfidence(it) }
                 .take(3)
 
+        // -------------------- ASSOCIATE Distance → nearest LED --------------------
+        data class BoxCtr(val cx: Float, val cy: Float, val x1: Int, val y1: Int, val x2: Int, val y2: Int)
+        val sizeF = YOLOLEDHelper.INPUT_SIZE.toFloat()
+        val right = (sizeF - 1).toInt()
+        val bottom = (sizeF - 1).toInt()
+
+        // Per-LED (classId 0..2) first/top box with coords
+        val ledBoxes = arrayOfNulls<BoxCtr>(3)
+        run {
+            for (det in ledDets) {
+                val cls = det.classId
+                if (cls in 0..2 && ledBoxes[cls] == null) {
+                    val cx = det.xCenter * sizeF
+                    val cy = det.yCenter * sizeF
+                    val w  = det.width  * sizeF
+                    val h  = det.height * sizeF
+                    val x1 = (cx - 0.5f * w).toInt().coerceIn(0, right)
+                    val y1 = (cy - 0.5f * h).toInt().coerceIn(0, bottom)
+                    val x2 = (cx + 0.5f * w).toInt().coerceIn(0, right)
+                    val y2 = (cy + 0.5f * h).toInt().coerceIn(0, bottom)
+                    ledBoxes[cls] = BoxCtr(cx, cy, x1, y1, x2, y2)
+                }
+            }
+        }
+
+        // Distance centers
+        val distCenters = distDets.map { d ->
+            val cx = d.xCenter * sizeF
+            val cy = d.yCenter * sizeF
+            Triple(cx, cy, d) // keep detection along with center
+        }.toMutableList()
+
+        // Greedy nearest-neighbor assignment (no reuse)
+        val distPerLedCm = arrayOf<Double?>(null, null, null)
+        val used = BooleanArray(distCenters.size)
+        for (ledIdx in 0..2) {
+            val lb = ledBoxes[ledIdx] ?: continue
+            var bestIdx = -1
+            var bestD2 = Float.MAX_VALUE
+            for (i in distCenters.indices) {
+                if (used[i]) continue
+                val (cx, cy, _) = distCenters[i]
+                val dx = cx - lb.cx
+                val dy = cy - lb.cy
+                val d2 = dx*dx + dy*dy
+                if (d2 < bestD2) { bestD2 = d2; bestIdx = i }
+            }
+            if (bestIdx >= 0) {
+                used[bestIdx] = true
+                val det = distCenters[bestIdx].third
+                val label = YOLODISTANCEHelper.classNameForId(det.classId) // e.g., "15"
+                distPerLedCm[ledIdx] = label.toDoubleOrNull()
+            }
+        }
+
         // -------------------- DRAWING --------------------
         if (Settings.BoundingBox.enableBoundingBox) {
-            val size = YOLOLEDHelper.INPUT_SIZE.toFloat()
-            val right = (size - 1).toInt()
-            val bottom = (size - 1).toInt()
-
             var xLb: Float; var yLb: Float; var wLb: Float; var hLb: Float
             var x1: Int; var y1: Int; var x2: Int; var y2: Int
             var confPct: Int
             val labelBuf = StringBuilder(64)
 
-            // LED boxes
+            // LED boxes (with associated distance text if present)
             if (ledDets.isNotEmpty()) {
                 ledDets.forEach { det ->
-                    xLb = det.xCenter * size
-                    yLb = det.yCenter * size
-                    wLb = det.width  * size
-                    hLb = det.height * size
+                    xLb = det.xCenter * sizeF
+                    yLb = det.yCenter * sizeF
+                    wLb = det.width  * sizeF
+                    hLb = det.height * sizeF
 
                     x1 = (xLb - 0.5f * wLb).toInt().coerceIn(0, right)
                     y1 = (yLb - 0.5f * hLb).toInt().coerceIn(0, bottom)
@@ -225,12 +275,14 @@ class VideoProcessor(private val context: Context) {
                     y2 = (yLb + 0.5f * hLb).toInt().coerceIn(0, bottom)
 
                     confPct = (YOLOLEDHelper.getConfidence(det) * 100f + 0.5f).toInt()
+                    val ledName = YOLOLEDHelper.classNameForId(det.classId)
+                    val distForThisLed = distPerLedCm.getOrNull(det.classId)
                     labelBuf.clear()
-                    labelBuf.append("LED: ")
-                        .append(YOLOLEDHelper.classNameForId(det.classId))
-                        .append(" - Acc: ")
-                        .append(confPct)
-                        .append('%')
+                    labelBuf.append("LED: ").append(ledName)
+                        .append(" - Acc: ").append(confPct).append('%')
+                    if (distForThisLed != null) {
+                        labelBuf.append(" - Dist: ").append(distForThisLed.toInt()).append(" CM")
+                    }
 
                     val color = Settings.BoundingBox.perClassColors.getOrNull(det.classId)
                         ?: Settings.BoundingBox.fallbackBoxColor
@@ -261,13 +313,13 @@ class VideoProcessor(private val context: Context) {
                 }
             }
 
-            // Distance boxes (up to 3)
+            // Distance boxes (up to 3) — unchanged drawing
             if (distDets.isNotEmpty()) {
                 distDets.forEach { det ->
-                    xLb = det.xCenter * size
-                    yLb = det.yCenter * size
-                    wLb = det.width  * size
-                    hLb = det.height * size
+                    xLb = det.xCenter * sizeF
+                    yLb = det.yCenter * sizeF
+                    wLb = det.width  * sizeF
+                    hLb = det.height * sizeF
 
                     x1 = (xLb - 0.5f * wLb).toInt().coerceIn(0, right)
                     y1 = (yLb - 0.5f * hLb).toInt().coerceIn(0, bottom)
@@ -275,12 +327,8 @@ class VideoProcessor(private val context: Context) {
                     y2 = (yLb + 0.5f * hLb).toInt().coerceIn(0, bottom)
 
                     confPct = (YOLODISTANCEHelper.getConfidence(det) * 100f + 0.5f).toInt()
-                    labelBuf.clear()
-                    labelBuf.append("DIST: ")
-                        .append(YOLODISTANCEHelper.classNameForId(det.classId))
-                        .append(" - Acc: ")
-                        .append(confPct)
-                        .append('%')
+                    val distLabel = YOLODISTANCEHelper.classNameForId(det.classId)
+                    val distText = "DIST: $distLabel - Acc: $confPct%"
 
                     val distColor = Settings.BoundingBox.fallbackBoxColor
                     Imgproc.rectangle(
@@ -294,7 +342,7 @@ class VideoProcessor(private val context: Context) {
                     )
                     Imgproc.putText(
                         workMat,
-                        labelBuf.toString(),
+                        distText,
                         org.opencv.core.Point(x1.toDouble(), (y1 - 6).coerceAtLeast(10).toDouble()),
                         Imgproc.FONT_HERSHEY_SIMPLEX,
                         0.7, distColor, 2, Imgproc.LINE_AA, false
@@ -310,28 +358,25 @@ class VideoProcessor(private val context: Context) {
             }
         }
 
-        // -------------------- LOGGING (LED centers + top-3 distance labels) --------------------
+        // -------------------- LOGGING (per LED distance) --------------------
         val nowMs = System.currentTimeMillis()
-        val sizeF = YOLOLEDHelper.INPUT_SIZE.toFloat()
-        val right = (sizeF - 1).toInt()
-        val bottom = (sizeF - 1).toInt()
 
+        // LED centers in pixels (for log)
         val ledCenters = arrayOfNulls<Pair<Int, Int>>(3)
-        for (det in ledDets) {
-            val cls = det.classId
-            if (cls in 0..2 && ledCenters[cls] == null) {
-                val cx = (det.xCenter * sizeF).toInt().coerceIn(0, right)
-                val cy = (det.yCenter * sizeF).toInt().coerceIn(0, bottom)
-                ledCenters[cls] = cx to cy
+        for (cls in 0..2) {
+            ledBoxes[cls]?.let { b ->
+                ledCenters[cls] = b.cx.toInt().coerceIn(0, right) to b.cy.toInt().coerceIn(0, bottom)
             }
         }
-        val distLabels: List<String> = distDets.map { YOLODISTANCEHelper.classNameForId(it.classId) }
+
         ledDistSamples += LedDistanceSample(
             tMillis = nowMs,
             led1 = ledCenters[0],
             led2 = ledCenters[1],
             led3 = ledCenters[2],
-            distLabels = distLabels
+            dist1Cm = distPerLedCm[0],
+            dist2Cm = distPerLedCm[1],
+            dist3Cm = distPerLedCm[2]
         )
 
         // 6) Convert Mat → Bitmap safely
@@ -350,12 +395,13 @@ class VideoProcessor(private val context: Context) {
     }
 
     fun writeLedDistLogToFile(): File? {
-        fun fmt(pt: Pair<Int, Int>?): String =
-            pt?.let { "(x=${it.first}, y=${it.second})" } ?: "(x=N/A, y=N/A)"
+        fun fmtCoordBraced(pt: Pair<Int, Int>?): String =
+            if (pt == null) "{x=N/A, y=N/A}" else "{x=${pt.first}, y=${pt.second}}"
+
+        fun fmtDistanceBraced(v: Double?): String =
+            if (v == null) "{N/A}" else "{${v.toInt()} CM}"
 
         val name = "LiFind_Log.txt"
-
-        // Public Documents dir
         val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
         if (!docsDir.exists()) docsDir.mkdirs()
 
@@ -363,19 +409,10 @@ class VideoProcessor(private val context: Context) {
         try {
             PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
                 synchronized(ledDistSamples) {
-                    val s = ledDistSamples.lastOrNull()
-                    if (s != null) {
-                        val d1 = s.distLabels.getOrNull(0) ?: "N/A"
-                        val d2 = s.distLabels.getOrNull(1) ?: "N/A"
-                        val d3 = s.distLabels.getOrNull(2) ?: "N/A"
-
-                        val line =
-                            "LED_1 - ${fmt(s.led1)}, " +
-                                    "LED_2 - ${fmt(s.led2)}, " +
-                                    "LED_3 - ${fmt(s.led3)}, " +
-                                    "DISTANCE_1: $d1, DISTANCE_2: $d2, DISTANCE_3: $d3"
-                        out.println(line)
-                    }
+                    val s = ledDistSamples.lastOrNull() ?: return@use
+                    out.println("LED_1 -> Coordinates: ${fmtCoordBraced(s.led1)} - Distance: ${fmtDistanceBraced(s.dist1Cm)}")
+                    out.println("LED_2 -> Coordinates: ${fmtCoordBraced(s.led2)} - Distance: ${fmtDistanceBraced(s.dist2Cm)}")
+                    out.println("LED_3 -> Coordinates: ${fmtCoordBraced(s.led3)} - Distance: ${fmtDistanceBraced(s.dist3Cm)}")
                 }
             }
             return outFile
