@@ -36,7 +36,7 @@ private data class LedDistanceSample(
     val led1: Pair<Int, Int>?,  // (x,y) in 640×640 px
     val led2: Pair<Int, Int>?,
     val led3: Pair<Int, Int>?,
-    val distLabel: String?      // e.g., "Near" or "" if not detected
+    val distLabels: List<String> // up to 3 distance class labels (e.g., ["Near","Mid","Far"])
 )
 
 private val ledDistSamples = java.util.Collections.synchronizedList(mutableListOf<LedDistanceSample>())
@@ -149,16 +149,20 @@ class VideoProcessor(private val context: Context) {
     ): Pair<Bitmap, Bitmap>? = withContext(Dispatchers.Default) {
         if (!opencvLoaded.get()) return@withContext null
 
-        // 1) Auto-orient + resize to 640×640 ARGB_8888 (shared input for both models)
+        // 1) Prepare 640×640 input
         val inputBitmap = YOLOLEDHelper.autoOrientAndResize(bitmap)
+        if (inputBitmap.isRecycled) return@withContext null
         ensureReusedBitmaps()
 
-        // 2) Prepare TFLite input (reused TensorImage)
+        // 2) Sync Mat ← Bitmap (allocate/resize workMat as needed)
+        Utils.bitmapToMat(inputBitmap, workMat)
+
+        // 3) Load shared TFLite input
         tensorImage.load(inputBitmap)
 
         // -------------------- LED MODEL (multi-box) --------------------
         val ledInterp = YOLOLEDHelper.ensureInterpreter(context)
-        ensureOutputBuffers(ledInterp) // updates class-level outShape + distOut for LED head
+        ensureOutputBuffers(ledInterp) // keeps distOut sized for (LED head) shape
         synchronized(ledInterp) {
             ledInterp.run(tensorImage.buffer, distOut)
         }
@@ -170,33 +174,33 @@ class VideoProcessor(private val context: Context) {
             multiLabelPerBox = Settings.Inference.multiLabelPerBox,
             expectedClasses = 3
         )
-        val ledDets =
+
+        val ledDets: List<DetectionResult> =
             if (Settings.Inference.topPerClass > 0)
                 YOLOLEDHelper.selectTopPerClass(rawLedDetections, Settings.Inference.topPerClass)
             else rawLedDetections
 
-        // -------------------- DISTANCE MODEL (one-box) --------------------
+        // -------------------- DISTANCE MODEL (top-3) --------------------
         val distInterp = YOLODISTANCEHelper.ensureInterpreter(context)
-        val distShape = distInterp.getOutputTensor(0).shape() // e.g., [1,84,8400] or [1,8400,84], etc.
-        val distHead: Array<Array<FloatArray>> =
-            Array(distShape[0]) { Array(distShape[1]) { FloatArray(distShape[2]) } }
+        val distShape = distInterp.getOutputTensor(0).shape() // e.g., [1,84,8400] or [1,8400,84]
+        val distHead = Array(distShape[0]) { Array(distShape[1]) { FloatArray(distShape[2]) } }
 
         synchronized(distInterp) {
             distInterp.run(tensorImage.buffer, distHead)
         }
 
-        // Robust parse with auto-K + class-agnostic NMS, then take top-1
-        val bestDistance = YOLODISTANCEHelper.parseTFLiteOneBox(
-            raw = distHead,
-            confidenceThreshold = Settings.Inference.confidenceThreshold,
-            multiLabelPerBox = Settings.Inference.multiLabelPerBox,
-            expectedClasses = 0,       // <=0 => auto-detect K (fixes your 8400/84 issue)
-            classAgnosticNms = true
-        )
+        val distDets: List<DetectionResult> =
+            YOLODISTANCEHelper.parseTFLite(
+                raw = distHead,
+                confidenceThreshold = Settings.Inference.confidenceThreshold,
+                multiLabelPerBox = Settings.Inference.multiLabelPerBox,
+                expectedClasses = 3,
+                classAgnosticNms = true
+            )
+                .sortedByDescending { YOLODISTANCEHelper.getConfidence(it) }
+                .take(3)
 
         // -------------------- DRAWING --------------------
-        Utils.bitmapToMat(inputBitmap, workMat)
-
         if (Settings.BoundingBox.enableBoundingBox) {
             val size = YOLOLEDHelper.INPUT_SIZE.toFloat()
             val right = (size - 1).toInt()
@@ -204,13 +208,12 @@ class VideoProcessor(private val context: Context) {
 
             var xLb: Float; var yLb: Float; var wLb: Float; var hLb: Float
             var x1: Int; var y1: Int; var x2: Int; var y2: Int
-            var color: Scalar
             var confPct: Int
-            val labelBuf = StringBuilder(48)
+            val labelBuf = StringBuilder(64)
 
-            // Draw LED detections (multi-box)
+            // LED boxes
             if (ledDets.isNotEmpty()) {
-                for (det in ledDets) {
+                ledDets.forEach { det ->
                     xLb = det.xCenter * size
                     yLb = det.yCenter * size
                     wLb = det.width  * size
@@ -223,13 +226,13 @@ class VideoProcessor(private val context: Context) {
 
                     confPct = (YOLOLEDHelper.getConfidence(det) * 100f + 0.5f).toInt()
                     labelBuf.clear()
-                    labelBuf.append("OOK: ")
+                    labelBuf.append("LED: ")
                         .append(YOLOLEDHelper.classNameForId(det.classId))
                         .append(" - Acc: ")
                         .append(confPct)
                         .append('%')
 
-                    color = Settings.BoundingBox.perClassColors.getOrNull(det.classId)
+                    val color = Settings.BoundingBox.perClassColors.getOrNull(det.classId)
                         ?: Settings.BoundingBox.fallbackBoxColor
 
                     Imgproc.rectangle(
@@ -241,7 +244,6 @@ class VideoProcessor(private val context: Context) {
                         Imgproc.LINE_AA,
                         0
                     )
-
                     Imgproc.putText(
                         workMat,
                         labelBuf.toString(),
@@ -249,7 +251,6 @@ class VideoProcessor(private val context: Context) {
                         Imgproc.FONT_HERSHEY_SIMPLEX,
                         0.7, color, 2, Imgproc.LINE_AA, false
                     )
-
                     if (Settings.BoundingBox.drawCenterDot) {
                         Imgproc.circle(
                             workMat,
@@ -260,89 +261,91 @@ class VideoProcessor(private val context: Context) {
                 }
             }
 
-            // Draw the single best Distance detection (one-box)
-            if (bestDistance != null) {
-                xLb = bestDistance.xCenter * size
-                yLb = bestDistance.yCenter * size
-                wLb = bestDistance.width  * size
-                hLb = bestDistance.height * size
+            // Distance boxes (up to 3)
+            if (distDets.isNotEmpty()) {
+                distDets.forEach { det ->
+                    xLb = det.xCenter * size
+                    yLb = det.yCenter * size
+                    wLb = det.width  * size
+                    hLb = det.height * size
 
-                x1 = (xLb - 0.5f * wLb).toInt().coerceIn(0, right)
-                y1 = (yLb - 0.5f * hLb).toInt().coerceIn(0, bottom)
-                x2 = (xLb + 0.5f * wLb).toInt().coerceIn(0, right)
-                y2 = (yLb + 0.5f * hLb).toInt().coerceIn(0, bottom)
+                    x1 = (xLb - 0.5f * wLb).toInt().coerceIn(0, right)
+                    y1 = (yLb - 0.5f * hLb).toInt().coerceIn(0, bottom)
+                    x2 = (xLb + 0.5f * wLb).toInt().coerceIn(0, right)
+                    y2 = (yLb + 0.5f * hLb).toInt().coerceIn(0, bottom)
 
-                confPct = (YOLODISTANCEHelper.getConfidence(bestDistance) * 100f + 0.5f).toInt()
-                val distLabel = YOLODISTANCEHelper.classNameForId(bestDistance.classId)
-                val distText = "DIST: $distLabel - Acc: $confPct%"
+                    confPct = (YOLODISTANCEHelper.getConfidence(det) * 100f + 0.5f).toInt()
+                    labelBuf.clear()
+                    labelBuf.append("DIST: ")
+                        .append(YOLODISTANCEHelper.classNameForId(det.classId))
+                        .append(" - Acc: ")
+                        .append(confPct)
+                        .append('%')
 
-                val distColor = Settings.BoundingBox.fallbackBoxColor
-
-                Imgproc.rectangle(
-                    workMat,
-                    org.opencv.core.Point(x1.toDouble(), y1.toDouble()),
-                    org.opencv.core.Point(x2.toDouble(), y2.toDouble()),
-                    distColor,
-                    max(2, Settings.BoundingBox.boxThickness),
-                    Imgproc.LINE_AA,
-                    0
-                )
-                Imgproc.putText(
-                    workMat,
-                    distText,
-                    org.opencv.core.Point(x1.toDouble(), (y1 - 6).coerceAtLeast(10).toDouble()),
-                    Imgproc.FONT_HERSHEY_SIMPLEX,
-                    0.7, distColor, 2, Imgproc.LINE_AA, false
-                )
-
-                if (Settings.BoundingBox.drawCenterDot) {
-                    Imgproc.circle(
+                    val distColor = Settings.BoundingBox.fallbackBoxColor
+                    Imgproc.rectangle(
                         workMat,
-                        org.opencv.core.Point(xLb.toDouble(), yLb.toDouble()),
-                        3, distColor, Imgproc.FILLED
+                        org.opencv.core.Point(x1.toDouble(), y1.toDouble()),
+                        org.opencv.core.Point(x2.toDouble(), y2.toDouble()),
+                        distColor,
+                        max(2, Settings.BoundingBox.boxThickness),
+                        Imgproc.LINE_AA,
+                        0
                     )
+                    Imgproc.putText(
+                        workMat,
+                        labelBuf.toString(),
+                        org.opencv.core.Point(x1.toDouble(), (y1 - 6).coerceAtLeast(10).toDouble()),
+                        Imgproc.FONT_HERSHEY_SIMPLEX,
+                        0.7, distColor, 2, Imgproc.LINE_AA, false
+                    )
+                    if (Settings.BoundingBox.drawCenterDot) {
+                        Imgproc.circle(
+                            workMat,
+                            org.opencv.core.Point(xLb.toDouble(), yLb.toDouble()),
+                            3, distColor, Imgproc.FILLED
+                        )
+                    }
                 }
             }
         }
 
-        // After computing `ledDets` and optional `bestDistance`...
+        // -------------------- LOGGING (LED centers + top-3 distance labels) --------------------
         val nowMs = System.currentTimeMillis()
+        val sizeF = YOLOLEDHelper.INPUT_SIZE.toFloat()
+        val right = (sizeF - 1).toInt()
+        val bottom = (sizeF - 1).toInt()
 
         val ledCenters = arrayOfNulls<Pair<Int, Int>>(3)
-        run {
-            val size = YOLOLEDHelper.INPUT_SIZE.toFloat()
-            val right = (size - 1).toInt()
-            val bottom = (size - 1).toInt()
-
-            for (det in ledDets) {
-                val cls = det.classId
-                if (cls in 0..2 && ledCenters[cls] == null) {
-                    val cx = (det.xCenter * size).toInt().coerceIn(0, right)
-                    val cy = (det.yCenter * size).toInt().coerceIn(0, bottom)
-                    ledCenters[cls] = cx to cy
-                }
+        for (det in ledDets) {
+            val cls = det.classId
+            if (cls in 0..2 && ledCenters[cls] == null) {
+                val cx = (det.xCenter * sizeF).toInt().coerceIn(0, right)
+                val cy = (det.yCenter * sizeF).toInt().coerceIn(0, bottom)
+                ledCenters[cls] = cx to cy
             }
         }
-
-        var distLabel: String? = null
-        bestDistance?.let { bd ->
-            distLabel = YOLODISTANCEHelper.classNameForId(bd.classId)
-        }
-
-        // Push one entry into buffer
+        val distLabels: List<String> = distDets.map { YOLODISTANCEHelper.classNameForId(it.classId) }
         ledDistSamples += LedDistanceSample(
             tMillis = nowMs,
             led1 = ledCenters[0],
             led2 = ledCenters[1],
             led3 = ledCenters[2],
-            distLabel = distLabel
+            distLabels = distLabels
         )
 
-        // 6) Convert Mat back to bitmap(s)
-        val annotated = reusedOutBitmap!!
+        // 6) Convert Mat → Bitmap safely
+        val matW = workMat.cols()
+        val matH = workMat.rows()
+        val annotated = reusedOutBitmap!!.let {
+            if (it.width != matW || it.height != matH) {
+                reusedOutBitmap = Bitmap.createBitmap(matW, matH, Bitmap.Config.ARGB_8888)
+                reusedOutBitmap!!
+            } else it
+        }
         Utils.matToBitmap(workMat, annotated)
 
-        // Return (annotated, 640x640 input used for inference)
+        // Return (annotated overlay, and the 640×640 model input)
         annotated to inputBitmap
     }
 
@@ -360,14 +363,17 @@ class VideoProcessor(private val context: Context) {
         try {
             PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
                 synchronized(ledDistSamples) {
-                    // ✅ only take the last entry if it exists
                     val s = ledDistSamples.lastOrNull()
                     if (s != null) {
+                        val d1 = s.distLabels.getOrNull(0) ?: "N/A"
+                        val d2 = s.distLabels.getOrNull(1) ?: "N/A"
+                        val d3 = s.distLabels.getOrNull(2) ?: "N/A"
+
                         val line =
                             "LED_1 - ${fmt(s.led1)}, " +
                                     "LED_2 - ${fmt(s.led2)}, " +
                                     "LED_3 - ${fmt(s.led3)}, " +
-                                    "DISTANCE: ${s.distLabel ?: "N/A"}"
+                                    "DISTANCE_1: $d1, DISTANCE_2: $d2, DISTANCE_3: $d3"
                         out.println(line)
                     }
                 }

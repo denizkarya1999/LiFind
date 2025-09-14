@@ -28,28 +28,59 @@ class MapActivity : AppCompatActivity() {
         val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
         val logFile = File(docsDir, "LiFind_Log.txt")
 
-        // Parse only the LED line
+        // Defaults
+        var LED_1 = Point(0.0, 0.0)
+        var LED_2 = Point(0.0, 0.0)
+        var LED_3 = Point(0.0, 0.0)
+        var Distance_1: Double = 0.0
+        var Distance_2: Double = 0.0
+        var Distance_3: Double = 0.0
+
+        fun parseNum(token: String?): Double {
+            return token?.trim()?.toDoubleOrNull() ?: 0.0
+        }
+
         if (logFile.exists()) {
-            logFile.useLines { lines ->
-                // Prefer the LAST occurrence in case there are multiple entries
-                val ledLine = lines.lastOrNull { it.contains("LED_1") }
-                ledLine?.let { line ->
-                    val ledRegex = Regex(
-                        """LED_1\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_2\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_3\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*DISTANCE:\s*([-\d.]+)"""
-                    )
-                    ledRegex.find(line)?.destructured?.let { (x1,y1,x2,y2,x3,y3,dist) ->
-                        led1 = Point(x1.toDoubleOrNull() ?: 0.0, y1.toDoubleOrNull() ?: 0.0)
-                        led2 = Point(x2.toDoubleOrNull() ?: 0.0, y2.toDoubleOrNull() ?: 0.0)
-                        led3 = Point(x3.toDoubleOrNull() ?: 0.0, y3.toDoubleOrNull() ?: 0.0)
-                        distance = dist.toDoubleOrNull() ?: 0.0
+            logFile.useLines { seq ->
+                val last = seq.lastOrNull { it.contains("LED_1") } ?: return@useLines
+
+                // Parse LED coordinates
+                val ledsRe = Regex(
+                    """LED_1\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_2\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)\s*,\s*LED_3\s*-\s*\(x=([-\d.]+),\s*y=([-\d.]+)\)"""
+                )
+                ledsRe.find(last)?.destructured?.let { (x1, y1, x2, y2, x3, y3) ->
+                    LED_1 = Point(x1.toDoubleOrNull() ?: 0.0, y1.toDoubleOrNull() ?: 0.0)
+                    LED_2 = Point(x2.toDoubleOrNull() ?: 0.0, y2.toDoubleOrNull() ?: 0.0)
+                    LED_3 = Point(x3.toDoubleOrNull() ?: 0.0, y3.toDoubleOrNull() ?: 0.0)
+                }
+
+                // Try NEW format with Distance_1, Distance_2, Distance_3
+                val tripleRe = Regex(
+                    """DISTANCE_1:\s*([-\w.]+)\s*,\s*DISTANCE_2:\s*([-\w.]+)\s*,\s*DISTANCE_3:\s*([-\w.]+)"""
+                )
+                val triple = tripleRe.find(last)?.destructured
+                if (triple != null) {
+                    val (t1, t2, t3) = triple
+                    Distance_1 = parseNum(t1)
+                    Distance_2 = parseNum(t2)
+                    Distance_3 = parseNum(t3)
+                } else {
+                    // Fallback OLD format: single DISTANCE applied to all
+                    val singleRe = Regex("""DISTANCE:\s*([-\d.]+)""")
+                    singleRe.find(last)?.destructured?.let { (dist) ->
+                        val v = parseNum(dist)
+                        Distance_1 = v; Distance_2 = v; Distance_3 = v
                     }
                 }
             }
         }
 
-        // No user position in the log → we won't set one
+        // Pass explicitly labeled LED and Distance values
         val mapView = MapGridView(this).apply {
-            setDetectedPixelData(listOf(led1, led2, led3), listOf(distance, distance, distance))
+            setDetectedPixelData(
+                listOf(LED_1, LED_2, LED_3),
+                listOf(Distance_1, Distance_2, Distance_3)
+            )
         }
         setContentView(mapView)
     }
