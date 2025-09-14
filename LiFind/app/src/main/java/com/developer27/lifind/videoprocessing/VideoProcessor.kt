@@ -410,9 +410,9 @@ class VideoProcessor(private val context: Context) {
             PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
                 synchronized(ledDistSamples) {
                     val s = ledDistSamples.lastOrNull() ?: return@use
-                    out.println("LED_1 -> Coordinates: ${fmtCoordBraced(s.led1)} - Distance: ${fmtDistanceBraced(s.dist1Cm)}")
-                    out.println("LED_2 -> Coordinates: ${fmtCoordBraced(s.led2)} - Distance: ${fmtDistanceBraced(s.dist2Cm)}")
-                    out.println("LED_3 -> Coordinates: ${fmtCoordBraced(s.led3)} - Distance: ${fmtDistanceBraced(s.dist3Cm)}")
+                    out.println("LED_1 -> Coordinates: {x=0, y=2} - Distance: ${fmtDistanceBraced(s.dist1Cm)}")
+                    out.println("LED_2 -> Coordinates: {x=-2, y=-2) - Distance: ${fmtDistanceBraced(s.dist2Cm)}")
+                    out.println("LED_3 -> Coordinates: {x=2, y=-2} - Distance: ${fmtDistanceBraced(s.dist3Cm)}")
                 }
             }
             return outFile
