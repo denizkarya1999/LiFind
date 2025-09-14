@@ -1,5 +1,6 @@
 package com.developer27.lifind.trilateration
 
+import Trilateration
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -14,9 +15,6 @@ import org.opencv.core.Point
 import java.io.File
 
 class MapActivity : AppCompatActivity() {
-    // ----------------------------
-    // Class-level (global) vars
-    // ----------------------------
     private var LED_1: Point = Point(0.0, 0.0)
     private var LED_2: Point = Point(0.0, 0.0)
     private var LED_3: Point = Point(0.0, 0.0)
@@ -25,52 +23,65 @@ class MapActivity : AppCompatActivity() {
     private var LED_2_Distance: Double = 0.0
     private var LED_3_Distance: Double = 0.0
 
+    private var USER_POS: Pair<Double, Double> = 0.0 to 0.0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 1) Parse and populate LED_1..3 and LED_1_Distance..3 from the log
+        readLatestLedAndDistancesFromLog()
+
+        // 2) Convert OpenCV Points into simple (x,y) pairs
+        val ledCoords = listOf(
+            LED_1.x to LED_1.y,
+            LED_2.x to LED_2.y,
+            LED_3.x to LED_3.y
+        )
+        val distances = listOf(
+            LED_1_Distance,
+            LED_2_Distance,
+            LED_3_Distance
+        )
+
+        // 3) Call Trilateration with those six values
+        USER_POS = Trilateration.solve(ledCoords, distances)
+
+        // 4) Update ONLY the user position on the map
+        val mapView = MapGridView(this).apply {
+            setUserPixelPosition(USER_POS.first, USER_POS.second)
+        }
+        setContentView(mapView)
+    }
+
+    private fun readLatestLedAndDistancesFromLog() {
         val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
         val logFile = File(docsDir, "LiFind_Log.txt")
+        if (!logFile.exists()) return
 
-        // Helper to parse a distance token like "15 CM" or "N/A"
+        val re = Regex(
+            """LED_(\d)\s*->\s*Coordinates:\s*\{x=([-\d]+),\s*y=([-\d]+)\}\s*-\s*Distance:\s*\{([^}]*)\}"""
+        )
         fun parseDistance(token: String?): Double {
             if (token == null) return 0.0
             val m = Regex("""[-+]?\d+(?:\.\d+)?""").find(token)
             return m?.value?.toDoubleOrNull() ?: 0.0
         }
 
-        if (logFile.exists()) {
-            logFile.useLines { seq ->
-                // Regex matches lines like:
-                // LED_1 -> Coordinates: {x=123, y=456} - Distance: {15 CM}
-                val re = Regex(
-                    """LED_(\d)\s*->\s*Coordinates:\s*\{x=([-\d]+),\s*y=([-\d]+)\}\s*-\s*Distance:\s*\{([^}]*)\}"""
-                )
+        logFile.useLines { seq ->
+            seq.forEach { line ->
+                val m = re.find(line) ?: return@forEach
+                val idx = m.groupValues[1].toInt()
+                val x = m.groupValues[2].toDoubleOrNull() ?: 0.0
+                val y = m.groupValues[3].toDoubleOrNull() ?: 0.0
+                val distVal = parseDistance(m.groupValues[4])
 
-                seq.forEach { line ->
-                    val m = re.find(line) ?: return@forEach
-                    val idx = m.groupValues[1].toInt()
-                    val x = m.groupValues[2].toDoubleOrNull() ?: 0.0
-                    val y = m.groupValues[3].toDoubleOrNull() ?: 0.0
-                    val distStr = m.groupValues[4]
-                    val distVal = parseDistance(distStr)
-
-                    when (idx) {
-                        1 -> { LED_1 = Point(x, y); LED_1_Distance = distVal }
-                        2 -> { LED_2 = Point(x, y); LED_2_Distance = distVal }
-                        3 -> { LED_3 = Point(x, y); LED_3_Distance = distVal }
-                    }
+                when (idx) {
+                    1 -> { LED_1 = Point(x, y); LED_1_Distance = distVal }
+                    2 -> { LED_2 = Point(x, y); LED_2_Distance = distVal }
+                    3 -> { LED_3 = Point(x, y); LED_3_Distance = distVal }
                 }
             }
         }
-
-        // Pass parsed LEDs + distances to your MapGridView
-        val mapView = MapGridView(this).apply {
-            setDetectedPixelData(
-                listOf(LED_1, LED_2, LED_3),
-                listOf(LED_1_Distance, LED_2_Distance, LED_3_Distance)
-            )
-        }
-        setContentView(mapView)
     }
 }
 

@@ -26,6 +26,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
+import com.developer27.lifind.trilateration.MapActivity
 import com.developer27.lifind.videoprocessing.VideoProcessor
 
 class MainActivity : AppCompatActivity() {
@@ -142,11 +143,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         viewBinding.viewMapButton.setOnClickListener {
-            Log.d("MainActivity", "View Map clicked")
-        }
-
-        viewBinding.uploadButton.setOnClickListener {
-            pickMediaLauncher.launch("*/*")
+            openMapActivity()
         }
 
         pickMediaLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
@@ -177,6 +174,11 @@ class MainActivity : AppCompatActivity() {
                 "Unsupported file type!",
                 Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun openMapActivity() {
+        val intent = Intent(this, MapActivity::class.java)
+        startActivity(intent)
     }
 
     private fun startProcessingAndRecording() {
