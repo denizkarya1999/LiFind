@@ -146,69 +146,88 @@ class MapGridView @JvmOverloads constructor(
         val h = height.toFloat()
 
         // paints
-        val paintRoom   = Paint().apply { color = Color.LTGRAY; style = Paint.Style.FILL }
+        val paintRoom = Paint().apply { color = Color.LTGRAY; style = Paint.Style.FILL }
         val paintBorder = Paint().apply { color = Color.DKGRAY; style = Paint.Style.STROKE; strokeWidth = 4f }
-        val textPaint   = Paint().apply {
-            color       = Color.BLACK
-            textSize    = 48f
+        val textPaint = Paint().apply {
+            color = Color.BLACK
+            textSize = 48f
             isAntiAlias = true
-            textAlign   = Paint.Align.CENTER
+            textAlign = Paint.Align.CENTER
         }
-        val paintLed    = Paint().apply { color = Color.MAGENTA; style = Paint.Style.FILL; isAntiAlias = true }
+        val paintLed = Paint().apply { color = Color.MAGENTA; style = Paint.Style.FILL; isAntiAlias = true }
 
-        // 1) Top‐left room “T3”
+        // 1) Top-left room “T3”
         val t3Rect = RectF(0f, 0f, w * 0.5f, h * 0.2f)
         canvas.drawRect(t3Rect, paintRoom)
         canvas.drawRect(t3Rect, paintBorder)
-        canvas.drawText("T3",
+        canvas.drawText(
+            "T3",
             t3Rect.centerX(),
-            t3Rect.centerY() + textPaint.textSize/2f,
-            textPaint)
+            t3Rect.centerY() + textPaint.textSize / 2f,
+            textPaint
+        )
 
-        // 2) Top‐right “STO”
+        // 2) Top-right “STO”
         val stoRect = RectF(w * 0.8f, 0f, w, h * 0.2f)
         canvas.drawRect(stoRect, paintRoom)
         canvas.drawRect(stoRect, paintBorder)
-        canvas.drawText("STO",
+        canvas.drawText(
+            "STO",
             stoRect.centerX(),
-            stoRect.centerY() + textPaint.textSize/2f,
-            textPaint)
+            stoRect.centerY() + textPaint.textSize / 2f,
+            textPaint
+        )
 
-        // 3) Bottom‐left two tables T1 & T2
+        // 3) Bottom-left two tables T1 & T2
         val bottomTop = h * 0.8f
-        val t1Rect = RectF(0f,          bottomTop, w * 0.25f, h)
-        val t2Rect = RectF(w * 0.25f,   bottomTop, w * 0.5f,  h)
+        val t1Rect = RectF(0f, bottomTop, w * 0.25f, h)
+        val t2Rect = RectF(w * 0.25f, bottomTop, w * 0.5f, h)
+
         canvas.drawRect(t1Rect, paintRoom)
         canvas.drawRect(t1Rect, paintBorder)
-        canvas.drawText("T1",
+        canvas.drawText(
+            "T1",
             t1Rect.centerX(),
-            t1Rect.centerY() + textPaint.textSize/2f,
-            textPaint)
+            t1Rect.centerY() + textPaint.textSize / 2f,
+            textPaint
+        )
 
         canvas.drawRect(t2Rect, paintRoom)
         canvas.drawRect(t2Rect, paintBorder)
-        canvas.drawText("T2",
+        canvas.drawText(
+            "T2",
             t2Rect.centerX(),
-            t2Rect.centerY() + textPaint.textSize/2f,
-            textPaint)
+            t2Rect.centerY() + textPaint.textSize / 2f,
+            textPaint
+        )
 
-        // 4) Draw the three LEDs as circles in a triangle (LED1 at center, LED2 bottom‐left, LED3 bottom‐right)
-        val cx = w / 2f
-        val cy = h / 2f
-        val Horz = w * 0.25f
-        val Vert = h * 0.25f
+        // 4) Draw fixed LED anchors (LED_1, LED_2, LED_3) from world coords to canvas
         val radius = 30f
 
-        val ledPositions = listOf(
-            Pair(cx,               cy),               // LED1
-            Pair(cx - Horz, cy + Vert),     // LED2
-            Pair(cx + Horz, cy + Vert)      // LED3
+        // World-space coordinates (units arbitrary but consistent)
+        // Fixed order: LED_1, LED_2, LED_3
+        val ledWorld = listOf(
+            android.graphics.PointF(0f,  2f),  // LED_1
+            android.graphics.PointF(-2f, -2f), // LED_2
+            android.graphics.PointF(2f,  -2f)  // LED_3
         )
-        val ledLabels = listOf("LED1 (1010)","LED2 (1000)","LED3 (1001)")
+        val ledLabels = listOf("LED_1 (1010)", "LED_2 (1000)", "LED_3 (1001)")
 
-        ledPositions.forEachIndexed { i, (x,y) ->
-            canvas.drawCircle(x, y, radius, paintLed)
-            canvas.drawText(ledLabels[i], x, y - radius - 12f, textPaint)
+        fun worldToCanvas(p: android.graphics.PointF, cw: Float, ch: Float): android.graphics.PointF {
+            // Increase this so large radii still fit
+            val halfExtent = 5f   // covers from -30 to +30 in world units
+            val sx = cw / (halfExtent * 2f)
+            val sy = ch / (halfExtent * 2f)
+            val scale = minOf(sx, sy)
+            val cx = cw / 2f
+            val cy = ch / 2f
+            return android.graphics.PointF(cx + p.x * scale, cy - p.y * scale)
+        }
+
+        ledWorld.forEachIndexed { i, p ->
+            val c = worldToCanvas(p, w, h)
+            canvas.drawCircle(c.x, c.y, radius, paintLed)
+            canvas.drawText(ledLabels[i], c.x, c.y - radius - 12f, textPaint)
         }
     }
 
