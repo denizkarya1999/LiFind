@@ -25,7 +25,7 @@ object YOLODISTANCEHelper {
     // ------------- Model / I/O -------------
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_distance_100_yolo_11s.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_distance_100_yolo_11m.tflite"
 
     /** Public for convenience when wiring expected class count. */
     val NUM_CLASSES: Int get() = labels.size
@@ -71,7 +71,7 @@ object YOLODISTANCEHelper {
 
     // ------------- Labels / utilities -------------
 
-    private val labels = arrayOf("3", "6", "9", "12", "15", "18", "21", "24", "27", "30")
+    private val labels = arrayOf("9", "12", "15", "18", "21", "24", "27", "30")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"
