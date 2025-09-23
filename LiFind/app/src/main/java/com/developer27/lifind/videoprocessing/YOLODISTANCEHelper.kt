@@ -25,7 +25,7 @@ object YOLODISTANCEHelper {
     // ------------- Model / I/O -------------
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_distance_100_yolo_11m.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_distance_100_yolo_11s.tflite"
 
     /** Public for convenience when wiring expected class count. */
     val NUM_CLASSES: Int get() = labels.size

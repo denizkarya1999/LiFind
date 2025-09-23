@@ -17,7 +17,7 @@ import java.nio.channels.FileChannel
 object YOLOLEDHelper {
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_iso_100_yolo_11m.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_iso_100_yolo_11s.tflite"
 
     @Volatile
     private var interpreter: Interpreter? = null
@@ -85,7 +85,7 @@ object YOLOLEDHelper {
         return if (denom > 0f) inter / denom else 0f
     }
 
-    private val labels = arrayOf("1010", "1001", "1000")
+    private val labels = arrayOf("1010", "1000", "1001")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"
