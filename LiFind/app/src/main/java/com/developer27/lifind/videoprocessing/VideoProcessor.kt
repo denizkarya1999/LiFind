@@ -10,11 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
-import org.opencv.core.Core
-import org.opencv.core.CvType
-import org.opencv.core.Mat
 import org.opencv.core.Scalar
-import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.support.image.TensorImage
@@ -61,7 +57,7 @@ object Settings {
         var topPerClass: Int = 1
     }
     object BoundingBox {
-        var enableBoundingBox = true
+        var enableBoundingBox = false
 
         // BGR palette for OpenCV
         val perClassColors: Array<Scalar> = arrayOf(
@@ -150,6 +146,31 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
+    /**
+     * Empty OpenCV preprocessing stub — currently a no-op.
+     * Accepts a Bitmap, converts to Mat and back, and returns the same image.
+     * You can add actual preprocessing steps (e.g., cvtColor, blur, CLAHE) later.
+     */
+    private fun Preprocessing(srcBitmap: Bitmap): Bitmap {
+        val mat = org.opencv.core.Mat()
+        try {
+            // Load bitmap into Mat (BGR/A handling is done by Utils)
+            Utils.bitmapToMat(srcBitmap, mat)
+
+            // ----------------------------
+            // TODO: add preprocessing here
+            // e.g., Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
+            // ----------------------------
+
+            // Return a new bitmap (same size/config) from Mat
+            val out = Bitmap.createBitmap(srcBitmap.width, srcBitmap.height, Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(mat, out)
+            return out
+        } finally {
+            mat.release()
+        }
+    }
+
     private suspend fun processFrameInternalYOLO(
         bitmap: Bitmap
     ): Pair<Bitmap, Bitmap>? = withContext(Dispatchers.Default) {
@@ -160,18 +181,14 @@ class VideoProcessor(private val context: Context) {
         if (inputBitmap.isRecycled) return@withContext null
         ensureReusedBitmaps()
 
-        // Apply preprocessing (updates inputBitmap in place)
-        paintOOKMultiScale(
-            inputBitmap = inputBitmap,
-            workMat = workMat,
-            kSmall = 5,
-            kMed = 11,
-            gamma = 0.65,
-            hintAlpha = 0.25
-        )
+        // Apply preprocessing
+        val processedBitmap = Preprocessing(inputBitmap)
+
+        // Make sure the drawing Mat contains the image we will annotate
+        Utils.bitmapToMat(processedBitmap, workMat)
 
         // 3) Load shared TFLite input
-        tensorImage.load(inputBitmap)
+        tensorImage.load(processedBitmap)
 
         // -------------------- LED MODEL (multi-box) --------------------
         val ledInterp = YOLOLEDHelper.ensureInterpreter(context)
@@ -400,144 +417,6 @@ class VideoProcessor(private val context: Context) {
 
         // Return (annotated overlay, and the 640×640 model input)
         annotated to inputBitmap
-    }
-
-    /**
-     * Paints OOK stripes into B/G/R channels:
-     *   B = dark thin stripes (OFF hints)
-     *   G = bright thin stripes (ON hints)
-     *   R = dark wider stripes (spacing context)
-     *
-     * Writes result back to `inputBitmap` so your model gets the processed frame.
-     *
-     * @return true if successful, false if bitmap was recycled or OpenCV error occurred.
-     */
-    fun paintOOKMultiScale(
-        inputBitmap: android.graphics.Bitmap,
-        workMat: Mat,
-        kSmall: Int = 5,          // try 3,5,7
-        kMed: Int = 11,           // try 9,11,13
-        gamma: Double = 0.65,     // <1 brightens faint stripes
-        hintAlpha: Double = 0.25  // 0..1 blend of binary hint
-    ): Boolean {
-        if (inputBitmap.isRecycled) return false
-
-        // ensure odd kernel sizes
-        fun odd(n: Int) = if (n % 2 == 1) n else n + 1
-        val kS = odd(kSmall.coerceAtLeast(3))
-        val kM = odd(kMed.coerceAtLeast(5))
-
-        // Helpers
-        fun vbox(src: Mat, k: Int, dst: Mat) {
-            Imgproc.blur(src, dst, Size(1.0, k.toDouble()))
-        }
-        fun gammaLift(src32F: Mat, g: Double): Mat {
-            val n01 = Mat()
-            Core.normalize(src32F, n01, 0.0, 1.0, Core.NORM_MINMAX)
-            Core.pow(n01, g, n01)
-            val out8 = Mat()
-            n01.convertTo(out8, CvType.CV_8U, 255.0)
-            n01.release()
-            return out8
-        }
-
-        // Process
-        val gray = Mat()
-        val blurS = Mat()
-        val blurM = Mat()
-
-        val grayF = Mat()
-        val blurSF = Mat()
-        val blurMF = Mat()
-
-        val sSmall = Mat()
-        val sMed   = Mat()
-
-        val sSmallNeg = Mat()
-        val sMedNeg   = Mat()
-
-        val posS = Mat()
-        val negS = Mat()
-        val posM = Mat()
-        val negM = Mat()
-
-        val magSmall = Mat()
-        val hint = Mat()
-
-        val chB: Mat
-        val chG: Mat
-        val chR: Mat
-
-        try {
-            // Bitmap -> Mat (BGR)
-            Utils.bitmapToMat(inputBitmap, workMat)
-
-            // BGR -> Gray (8U)
-            Imgproc.cvtColor(workMat, gray, Imgproc.COLOR_BGR2GRAY)
-
-            // Vertical blurs at two scales (8U)
-            vbox(gray, kS, blurS)
-            vbox(gray, kM, blurM)
-
-            // Convert to 32F for signed math
-            gray.convertTo(grayF, CvType.CV_32F)
-            blurS.convertTo(blurSF, CvType.CV_32F)
-            blurM.convertTo(blurMF, CvType.CV_32F)
-
-            // Signed local contrast
-            Core.subtract(grayF, blurSF, sSmall) // gray - blurSmall
-            Core.subtract(grayF, blurMF, sMed)   // gray - blurMed
-
-            // Split into positive (bright) and negative (dark)
-            Core.max(sSmall, Scalar(0.0), posS)
-            Core.multiply(sSmall, Scalar(-1.0), sSmallNeg)
-            Core.max(sSmallNeg, Scalar(0.0), negS)
-
-            Core.max(sMed, Scalar(0.0), posM)
-            Core.multiply(sMed, Scalar(-1.0), sMedNeg)
-            Core.max(sMedNeg, Scalar(0.0), negM)
-
-            // Channel mapping with gamma lift
-            chB = gammaLift(negS, gamma) // OFF thin
-            chG = gammaLift(posS, gamma) // ON thin
-            chR = gammaLift(negM, gamma) // OFF wider
-
-            // Optional: binary hint from small-scale magnitude to sharpen edges
-            Core.absdiff(gray, blurS, magSmall) // 8U magnitude
-            Imgproc.adaptiveThreshold(
-                magSmall, hint, 255.0,
-                Imgproc.ADAPTIVE_THRESH_MEAN_C,
-                Imgproc.THRESH_BINARY,
-                /*blockSize*/ 15, /*C*/ -2.0
-            )
-            // Light vertical tidy to reduce speckles
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, 3.0))
-            Imgproc.morphologyEx(hint, hint, Imgproc.MORPH_OPEN, kernel)
-            kernel.release()
-
-            if (hintAlpha > 0.0) {
-                Core.addWeighted(chB, 1.0, hint, hintAlpha, 0.0, chB)
-                Core.addWeighted(chG, 1.0, hint, hintAlpha, 0.0, chG)
-                Core.addWeighted(chR, 1.0, hint, hintAlpha, 0.0, chR)
-            }
-
-            // Merge B,G,R back to workMat, then to Bitmap
-            Core.merge(listOf(chB, chG, chR), workMat)
-            Utils.matToBitmap(workMat, inputBitmap)
-
-            true
-        } catch (t: Throwable) {
-            false
-        } finally {
-            // Cleanup
-            gray.release(); blurS.release(); blurM.release()
-            grayF.release(); blurSF.release(); blurMF.release()
-            sSmall.release(); sMed.release()
-            sSmallNeg.release(); sMedNeg.release()
-            posS.release(); negS.release(); posM.release(); negM.release()
-            magSmall.release(); hint.release()
-        }
-        return true
     }
 
     fun writeLedDistLogToFile(): File? {
