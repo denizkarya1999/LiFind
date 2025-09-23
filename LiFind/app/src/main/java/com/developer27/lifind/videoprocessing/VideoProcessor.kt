@@ -10,7 +10,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Scalar
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.support.image.TensorImage
@@ -146,28 +150,80 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
-    /**
-     * Empty OpenCV preprocessing stub — currently a no-op.
-     * Accepts a Bitmap, converts to Mat and back, and returns the same image.
-     * You can add actual preprocessing steps (e.g., cvtColor, blur, CLAHE) later.
-     */
     private fun Preprocessing(srcBitmap: Bitmap): Bitmap {
-        val mat = org.opencv.core.Mat()
+        val mat = Mat()
+        val gray = Mat()
+        val thresh = Mat()
+        val hierarchy = Mat()
         try {
-            // Load bitmap into Mat (BGR/A handling is done by Utils)
+            // Load bitmap into Mat (RGBA)
             Utils.bitmapToMat(srcBitmap, mat)
 
-            // ----------------------------
-            // TODO: add preprocessing here
-            // e.g., Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
-            // ----------------------------
+            // --- 1) Grayscale + simple threshold for bright spots ---
+            Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
+            // Optional: small blur helps suppress speckle noise
+            Imgproc.GaussianBlur(gray, gray, Size(3.0, 3.0), 0.0)
+            Imgproc.threshold(gray, thresh, 200.0, 255.0, Imgproc.THRESH_BINARY)
 
-            // Return a new bitmap (same size/config) from Mat
+            // --- 2) Find contours (each bright region is a "light") ---
+            val contours: MutableList<MatOfPoint> = ArrayList()
+            Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+
+            // --- 3) Paint each light with a different color (filled) ---
+            // Draw on an overlay so we can blend with alpha
+            val overlay = mat.clone()
+
+            // Color palette (RGBA). Add/remove as you like.
+            val palette = listOf(
+                Scalar(255.0,   0.0,   0.0, 255.0),  // Blue
+                Scalar(  0.0, 255.0,   0.0, 255.0),  // Green
+                Scalar(  0.0,   0.0, 255.0, 255.0),  // Red
+                Scalar(  0.0, 255.0, 255.0, 255.0),  // Yellow
+                Scalar(255.0,   0.0, 255.0, 255.0),  // Magenta
+                Scalar(255.0, 255.0,   0.0, 255.0),  // Cyan
+                Scalar(255.0, 128.0,   0.0, 255.0),  // Orange
+                Scalar(128.0,   0.0, 255.0, 255.0)   // Violet
+            )
+
+            val minArea = 30.0  // ignore tiny blobs; tune as needed
+            var colorIdx = 0
+
+            for (contour in contours) {
+                val area = Imgproc.contourArea(contour)
+                if (area < minArea) continue
+
+                val color = palette[colorIdx % palette.size]
+                // Fill the contour on the overlay
+                Imgproc.drawContours(overlay, listOf(contour), -1, color, -1)
+
+                colorIdx++
+            }
+
+            // --- 4) Blend overlay onto original for semi-transparent paint ---
+            val alpha = 0.45 // opacity of the paint
+            Core.addWeighted(overlay, alpha, mat, 1.0 - alpha, 0.0, mat)
+
+            // (Optional) If you want a crisp outline around each region too:
+            /*
+            colorIdx = 0
+            for (contour in contours) {
+                val area = Imgproc.contourArea(contour)
+                if (area < minArea) continue
+                val color = palette[colorIdx % palette.size]
+                Imgproc.drawContours(mat, listOf(contour), -1, color, 2)
+                colorIdx++
+            }
+            */
+
+            // --- 5) Return Bitmap ---
             val out = Bitmap.createBitmap(srcBitmap.width, srcBitmap.height, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(mat, out)
             return out
         } finally {
             mat.release()
+            gray.release()
+            thresh.release()
+            hierarchy.release()
         }
     }
 
