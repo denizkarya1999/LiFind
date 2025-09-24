@@ -56,7 +56,7 @@ object Settings {
         var current: Mode = Mode.YOLO
     }
     object Inference {
-        var confidenceThreshold: Float = 0.90f
+        var confidenceThreshold: Float = 0.95f
         var iouThreshold: Float = 0.45f
         var classAgnosticNms: Boolean = false
         var multiLabelPerBox: Boolean = true
@@ -152,6 +152,7 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
+    //Do not remove this function, we might use preprocessing for LED detection experiments fail.
     private fun Preprocessing(srcBitmap: Bitmap): Bitmap {
         val mat = Mat()
         val gray = Mat()
@@ -261,13 +262,13 @@ class VideoProcessor(private val context: Context) {
         ensureReusedBitmaps()
 
         // Apply preprocessing
-        val processedBitmap = Preprocessing(inputBitmap)
+        //val processedBitmap = Preprocessing(inputBitmap)
 
         // Make sure the drawing Mat contains the image we will annotate
-        Utils.bitmapToMat(processedBitmap, workMat)
+        Utils.bitmapToMat(inputBitmap, workMat)
 
         // 3) Load shared TFLite input
-        tensorImage.load(processedBitmap)
+        tensorImage.load(inputBitmap)
 
         // -------------------- LED MODEL (multi-box) --------------------
         val ledInterp = YOLOLEDHelper.ensureInterpreter(context)

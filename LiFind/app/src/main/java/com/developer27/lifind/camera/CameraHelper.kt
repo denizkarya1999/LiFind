@@ -308,7 +308,7 @@ class CameraHelper(
 
         // Read ISO prefs
         val manualIsoEnabled = sharedPreferences.getBoolean("manual_iso_enabled", true)
-        val isoFromPrefs = sharedPreferences.getString("iso_value", "800")?.toIntOrNull() ?: 800
+        val isoFromPrefs = sharedPreferences.getString("iso_value", "100")?.toIntOrNull() ?: 100
         val safeISO = isoFromPrefs.coerceIn(isoRange.lower, isoRange.upper)
 
         // Fully manual exposure; if manual ISO disabled, we still must set *some* ISO because AE is off.
