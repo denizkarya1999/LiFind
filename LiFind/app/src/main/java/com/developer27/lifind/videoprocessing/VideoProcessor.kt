@@ -11,8 +11,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
 import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
+import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
@@ -61,13 +63,13 @@ object Settings {
         var topPerClass: Int = 1
     }
     object BoundingBox {
-        var enableBoundingBox = false
+        var enableBoundingBox = true
 
         // BGR palette for OpenCV
         val perClassColors: Array<Scalar> = arrayOf(
-            Scalar(0.0, 0.0, 255.0), // class 0 -> Red
-            Scalar(0.0, 255.0, 0.0), // class 1 -> Green
-            Scalar(255.0, 0.0, 0.0)  // class 2 -> Blue
+            Scalar(255.0, 0.0, 0.0), // class 0 -> Red
+            Scalar(80.0, 200.0, 120.0), // class 1 -> Green
+            Scalar(0.0, 150.0, 255.0)  // class 2 -> Blue
         )
         var boxThickness = 2
         val fallbackBoxColor = Scalar(255.0, 255.0, 255.0)
@@ -156,74 +158,95 @@ class VideoProcessor(private val context: Context) {
         val thresh = Mat()
         val hierarchy = Mat()
         try {
-            // Load bitmap into Mat (RGBA)
-            Utils.bitmapToMat(srcBitmap, mat)
+            Utils.bitmapToMat(srcBitmap, mat) // RGBA
 
-            // --- 1) Grayscale + simple threshold for bright spots ---
+            // 1) Bright mask (keep real stripes—no aggressive closing)
             Imgproc.cvtColor(mat, gray, Imgproc.COLOR_RGBA2GRAY)
-            // Optional: small blur helps suppress speckle noise
+            // Local contrast helps keep stripes under uneven lighting
+            val clahe = Imgproc.createCLAHE(2.0, Size(8.0, 8.0))
+            clahe.apply(gray, gray)
             Imgproc.GaussianBlur(gray, gray, Size(3.0, 3.0), 0.0)
-            Imgproc.threshold(gray, thresh, 200.0, 255.0, Imgproc.THRESH_BINARY)
+            Imgproc.threshold(gray, thresh, 180.0, 255.0, Imgproc.THRESH_BINARY) // tune 170–200
 
-            // --- 2) Find contours (each bright region is a "light") ---
-            val contours: MutableList<MatOfPoint> = ArrayList()
+            // 2) Detect bright blobs
+            val contours = ArrayList<MatOfPoint>()
             Imgproc.findContours(thresh, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            // --- 3) Paint each light with a different color (filled) ---
-            // Draw on an overlay so we can blend with alpha
-            val overlay = mat.clone()
+            val minArea = 30.0
+            val overlay = mat.clone() // RGBA
+            val verticalStripes = true // set false if your stripes are horizontal
+            val theta = if (verticalStripes) 0.0 else Math.PI / 2.0 // Gabor orientation
 
-            // Color palette (RGBA). Add/remove as you like.
-            val palette = listOf(
-                Scalar(255.0,   0.0,   0.0, 255.0),  // Blue
-                Scalar(  0.0, 255.0,   0.0, 255.0),  // Green
-                Scalar(  0.0,   0.0, 255.0, 255.0),  // Red
-                Scalar(  0.0, 255.0, 255.0, 255.0),  // Yellow
-                Scalar(255.0,   0.0, 255.0, 255.0),  // Magenta
-                Scalar(255.0, 255.0,   0.0, 255.0),  // Cyan
-                Scalar(255.0, 128.0,   0.0, 255.0),  // Orange
-                Scalar(128.0,   0.0, 255.0, 255.0)   // Violet
-            )
+            for (c in contours) {
+                if (Imgproc.contourArea(c) < minArea) continue
+                val rect = Imgproc.boundingRect(c)
+                if (rect.width < 6 || rect.height < 6) continue
 
-            val minArea = 30.0  // ignore tiny blobs; tune as needed
-            var colorIdx = 0
+                val roiColor = overlay.submat(rect)      // RGBA
+                val roiGray = Mat()
+                Imgproc.cvtColor(roiColor, roiGray, Imgproc.COLOR_RGBA2GRAY)
 
-            for (contour in contours) {
-                val area = Imgproc.contourArea(contour)
-                if (area < minArea) continue
+                // --- 3-band oriented filtering (fine / medium / coarse) ---
+                fun gaborResp(src: Mat, lambda: Double): Mat {
+                    val k = (lambda * 4.0).toInt() or 1  // odd kernel size
+                    val ksize = Size(k.toDouble(), k.toDouble())
+                    val sigma = lambda * 0.6
+                    val gamma = 0.5
+                    val psi = 0.0
+                    val kernel = Imgproc.getGaborKernel(ksize, sigma, theta, lambda, gamma, psi, CvType.CV_32F)
+                    val resp32 = Mat()
+                    Imgproc.filter2D(src, resp32, CvType.CV_32F, kernel)
+                    Core.absdiff(resp32, Scalar(0.0), resp32)
+                    val resp8 = Mat()
+                    Core.normalize(resp32, resp32, 0.0, 255.0, Core.NORM_MINMAX)
+                    resp32.convertTo(resp8, CvType.CV_8U)
+                    kernel.release(); resp32.release()
+                    return resp8
+                }
 
-                val color = palette[colorIdx % palette.size]
-                // Fill the contour on the overlay
-                Imgproc.drawContours(overlay, listOf(contour), -1, color, -1)
+                // Lambdas ~ expected stripe periods in pixels; adjust to your camera/shutter
+                val fine   = gaborResp(roiGray, 6.0)   // reacts to fine (fast OOK)
+                val medium = gaborResp(roiGray, 12.0)  // medium
+                val coarse = gaborResp(roiGray, 24.0)  // coarse (slow OOK)
 
-                colorIdx++
+                // Optional: make lines a bit thicker for YOLO readability after downscale
+                val thicken = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0, 2.0))
+                Imgproc.dilate(fine,   fine,   thicken)
+                Imgproc.dilate(medium, medium, thicken)
+                Imgproc.dilate(coarse, coarse, thicken)
+                thicken.release()
+
+                // --- Write into B,G,R channels of ROI, masked by the blob contour ---
+                val maskRoi = Mat.zeros(rect.height, rect.width, CvType.CV_8UC1)
+                val shifted = MatOfPoint(*c.toArray().map { p -> Point(p.x - rect.x, p.y - rect.y) }.toTypedArray())
+                Imgproc.drawContours(maskRoi, listOf(shifted), -1, Scalar(255.0), -1)
+
+                val ch = ArrayList<Mat>(4)
+                Core.split(roiColor, ch) // 0:B,1:G,2:R,3:A
+
+                // keep background, replace inside mask with our frequency maps
+                fine.copyTo(ch[0], maskRoi)    // B  = fine
+                medium.copyTo(ch[1], maskRoi)  // G  = medium
+                coarse.copyTo(ch[2], maskRoi)  // R  = coarse
+                // alpha unchanged
+
+                Core.merge(ch, roiColor)
+                ch.forEach { it.release() }
+                maskRoi.release()
+                shifted.release()
+                fine.release(); medium.release(); coarse.release()
+                roiGray.release()
+                roiColor.release()
             }
 
-            // --- 4) Blend overlay onto original for semi-transparent paint ---
-            val alpha = 0.45 // opacity of the paint
-            Core.addWeighted(overlay, alpha, mat, 1.0 - alpha, 0.0, mat)
+            // Blend slightly so original context remains; bump alpha if you want stronger cues
+            Core.addWeighted(overlay, 0.7, mat, 0.3, 0.0, mat)
 
-            // (Optional) If you want a crisp outline around each region too:
-            /*
-            colorIdx = 0
-            for (contour in contours) {
-                val area = Imgproc.contourArea(contour)
-                if (area < minArea) continue
-                val color = palette[colorIdx % palette.size]
-                Imgproc.drawContours(mat, listOf(contour), -1, color, 2)
-                colorIdx++
-            }
-            */
-
-            // --- 5) Return Bitmap ---
             val out = Bitmap.createBitmap(srcBitmap.width, srcBitmap.height, Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(mat, out)
             return out
         } finally {
-            mat.release()
-            gray.release()
-            thresh.release()
-            hierarchy.release()
+            mat.release(); gray.release(); thresh.release(); hierarchy.release()
         }
     }
 
