@@ -152,7 +152,7 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
-    //Do not remove this function, we might use preprocessing for LED detection experiments fail.
+    //Do not remove this function, we might use preprocessing for LED detection if experiments fail.
     private fun Preprocessing(srcBitmap: Bitmap): Bitmap {
         val mat = Mat()
         val gray = Mat()
