@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.RectF
 import android.os.Bundle
 import android.os.Environment
@@ -13,6 +14,7 @@ import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import org.opencv.core.Point
 import java.io.File
+import java.util.Locale
 
 class MapActivity : AppCompatActivity() {
     private var LED_1: Point = Point(0.0, 0.0)
@@ -31,11 +33,11 @@ class MapActivity : AppCompatActivity() {
         // 1) Parse and populate LED_1..3 and LED_1_Distance..3 from the log
         readLatestLedAndDistancesFromLog()
 
-        // 2) Convert OpenCV Points into simple (x,y) pairs
+        // 2) World LED anchors (same as Python layout)
         val ledCoords = listOf(
-            LED_1.x to LED_1.y,
-            LED_2.x to LED_2.y,
-            LED_3.x to LED_3.y
+            0.0 to 2.0,   // LED_1
+            -2.0 to -2.0, // LED_2
+            2.0 to -2.0   // LED_3
         )
         val distances = listOf(
             LED_1_Distance,
@@ -43,12 +45,13 @@ class MapActivity : AppCompatActivity() {
             LED_3_Distance
         )
 
-        // 3) Call Trilateration with those six values
+        // 3) Trilaterate
         USER_POS = Trilateration.solve(ledCoords, distances)
 
-        // 4) Update ONLY the user position on the map
+        // 4) Show map; pass user position in *world* coords and footer info
         val mapView = MapGridView(this).apply {
             setUserPixelPosition(USER_POS.first, USER_POS.second)
+            setFooterInfo(USER_POS, LED_1_Distance, LED_2_Distance, LED_3_Distance)
         }
         setContentView(mapView)
     }
@@ -90,159 +93,205 @@ class MapGridView @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    private val paintGrid =
-        Paint().apply { color = Color.LTGRAY; strokeWidth = 2f; isAntiAlias = true }
-    private val paintAxis =
-        Paint().apply { color = Color.DKGRAY; strokeWidth = 4f; isAntiAlias = true }
-    private val paintCircle =
-        Paint().apply { color = Color.MAGENTA; style = Paint.Style.FILL; isAntiAlias = true }
-    private val paintUser =
-        Paint().apply { color = Color.BLUE; strokeWidth = 8f; isAntiAlias = true }
+    // ---- World setup: 30×30 (−15..+15) ----
+    private val extentWorld = 30f
+    private val halfExtent = extentWorld / 2f
 
-    private var userPoint: Point? = null
-    private var detectedPts: List<Point> = emptyList()
-    private var detectedDists: List<Double> = emptyList()
+    // ---- Paints ----
+    private val paintGrid = Paint().apply {
+        color = Color.LTGRAY
+        strokeWidth = 1.5f
+        isAntiAlias = true
+    }
+    private val paintAxis = Paint().apply {
+        color = Color.DKGRAY
+        strokeWidth = 4f
+        isAntiAlias = true
+    }
+    private val paintWorldBg = Paint().apply {
+        color = Color.rgb(248, 246, 250) // light background inside world rect
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+    private val paintLed = Paint().apply {
+        color = Color.MAGENTA
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+    private val paintUser = Paint().apply {
+        color = Color.BLUE
+        strokeWidth = 8f
+        isAntiAlias = true
+    }
+    private val textPaint = Paint().apply {
+        color = Color.MAGENTA
+        textSize = 48f
+        isAntiAlias = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val footerPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 40f
+        isAntiAlias = true
+        textAlign = Paint.Align.LEFT
+    }
 
-    /** Set last trilaterated position in pixel space */
+    // ---- Data ----
+    private var userPoint: Point? = null // stored as *world* coords (x,y)
+    private var footerUser: Pair<Double, Double>? = null
+    private var footerD1: Double? = null
+    private var footerD2: Double? = null
+    private var footerD3: Double? = null
+
+    /** Treats inputs as *world* coordinates (name kept for compatibility). */
     fun setUserPixelPosition(x: Double, y: Double) {
         userPoint = Point(x, y)
         invalidate()
     }
 
-    /** Set raw LED centers *and* distances (unused here) */
-    fun setDetectedPixelData(pts: List<Point>, dists: List<Double>) {
-        detectedPts = pts
-        detectedDists = dists
+    /** Footer info: user position + distances for LED1..3 */
+    fun setFooterInfo(userPos: Pair<Double, Double>, d1: Double, d2: Double, d3: Double) {
+        footerUser = userPos
+        footerD1 = d1
+        footerD2 = d2
+        footerD3 = d3
         invalidate()
+    }
+
+    // ---- Helpers ----
+    private fun scale(viewW: Float, viewH: Float): Float =
+        minOf(viewW / extentWorld, viewH / extentWorld)
+
+    private fun worldRect(cw: Float, ch: Float): RectF {
+        val s = scale(cw, ch)
+        val cx = cw / 2f
+        val cy = ch / 2f
+        val halfW = halfExtent * s
+        val halfH = halfExtent * s
+        return RectF(cx - halfW, cy - halfH, cx + halfW, cy + halfH)
+    }
+
+    private fun worldToCanvas(px: Float, py: Float, cw: Float, ch: Float): PointF {
+        val s = scale(cw, ch)
+        val cx = cw / 2f
+        val cy = ch / 2f
+        return PointF(cx + px * s, cy - py * s) // y-up world → y-down canvas
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val r = worldRect(w, h)
+
+        // Outside world: black
+        canvas.drawColor(Color.BLACK)
+
+        // Inside world: light background
+        canvas.drawRect(r, paintWorldBg)
+
+        // Clip to 30×30 world, draw map content
+        canvas.save()
+        canvas.clipRect(r)
         drawGrid(canvas)
         drawAxes(canvas)
-        drawDetectedLeds(canvas)  // LEDs stay fixed in this implementation
+        drawAnchors(canvas)
         drawUser(canvas)
+        canvas.restore()
+
+        // Footer (drawn *outside* the clipped region, under the world rect)
+        drawFooter(canvas, r)
     }
 
     private fun drawGrid(canvas: Canvas) {
-        val step = 100
-        for (i in 0 until width step step) {
-            canvas.drawLine(i.toFloat(), 0f, i.toFloat(), height.toFloat(), paintGrid)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val s = scale(w, h)
+        val cx = w / 2f
+        val cy = h / 2f
+
+        val stepWorld = 1f // 1-unit world grid
+        var xw = -halfExtent
+        while (xw <= halfExtent + 1e-3f) {
+            val x = cx + xw * s
+            canvas.drawLine(x, cy - halfExtent * s, x, cy + halfExtent * s, paintGrid)
+            xw += stepWorld
         }
-        for (j in 0 until height step step) {
-            canvas.drawLine(0f, j.toFloat(), width.toFloat(), j.toFloat(), paintGrid)
+        var yw = -halfExtent
+        while (yw <= halfExtent + 1e-3f) {
+            val y = cy - yw * s
+            canvas.drawLine(cx - halfExtent * s, y, cx + halfExtent * s, y, paintGrid)
+            yw += stepWorld
         }
     }
 
     private fun drawAxes(canvas: Canvas) {
-        val cx = width / 2f
-        canvas.drawLine(cx, 0f, cx, height.toFloat(), paintAxis)
-        val cy = height / 2f
-        canvas.drawLine(0f, cy, width.toFloat(), cy, paintAxis)
-    }
-
-    private fun drawDetectedLeds(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
+        val s = scale(w, h)
+        val cx = w / 2f
+        val cy = h / 2f
+        canvas.drawLine(cx, cy - halfExtent * s, cx, cy + halfExtent * s, paintAxis)
+        canvas.drawLine(cx - halfExtent * s, cy, cx + halfExtent * s, cy, paintAxis)
+    }
 
-        // paints
-        val paintRoom = Paint().apply { color = Color.LTGRAY; style = Paint.Style.FILL }
-        val paintBorder = Paint().apply { color = Color.DKGRAY; style = Paint.Style.STROKE; strokeWidth = 4f }
-        val textPaint = Paint().apply {
-            color = Color.BLACK
-            textSize = 48f
-            isAntiAlias = true
-            textAlign = Paint.Align.CENTER
-        }
-        val paintLed = Paint().apply { color = Color.MAGENTA; style = Paint.Style.FILL; isAntiAlias = true }
+    private fun drawAnchors(canvas: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val radiusPx = 30f
 
-        // 1) Top-left room “T3”
-        val t3Rect = RectF(0f, 0f, w * 0.5f, h * 0.2f)
-        canvas.drawRect(t3Rect, paintRoom)
-        canvas.drawRect(t3Rect, paintBorder)
-        canvas.drawText(
-            "T3",
-            t3Rect.centerX(),
-            t3Rect.centerY() + textPaint.textSize / 2f,
-            textPaint
-        )
-
-        // 2) Top-right “STO”
-        val stoRect = RectF(w * 0.8f, 0f, w, h * 0.2f)
-        canvas.drawRect(stoRect, paintRoom)
-        canvas.drawRect(stoRect, paintBorder)
-        canvas.drawText(
-            "STO",
-            stoRect.centerX(),
-            stoRect.centerY() + textPaint.textSize / 2f,
-            textPaint
-        )
-
-        // 3) Bottom-left two tables T1 & T2
-        val bottomTop = h * 0.8f
-        val t1Rect = RectF(0f, bottomTop, w * 0.25f, h)
-        val t2Rect = RectF(w * 0.25f, bottomTop, w * 0.5f, h)
-
-        canvas.drawRect(t1Rect, paintRoom)
-        canvas.drawRect(t1Rect, paintBorder)
-        canvas.drawText(
-            "T1",
-            t1Rect.centerX(),
-            t1Rect.centerY() + textPaint.textSize / 2f,
-            textPaint
-        )
-
-        canvas.drawRect(t2Rect, paintRoom)
-        canvas.drawRect(t2Rect, paintBorder)
-        canvas.drawText(
-            "T2",
-            t2Rect.centerX(),
-            t2Rect.centerY() + textPaint.textSize / 2f,
-            textPaint
-        )
-
-        // 4) Draw fixed LED anchors (LED_1, LED_2, LED_3) from world coords to canvas
-        val radius = 30f
-
-        // World-space coordinates (units arbitrary but consistent)
-        // Fixed order: LED_1, LED_2, LED_3
         val ledWorld = listOf(
-            android.graphics.PointF(0f,  2f),  // LED_1
-            android.graphics.PointF(-2f, -2f), // LED_2
-            android.graphics.PointF(2f,  -2f)  // LED_3
+            PointF( 0f,  2f), // LED_1
+            PointF(-2f, -2f), // LED_2
+            PointF( 2f, -2f)  // LED_3
         )
-        val ledLabels = listOf("LED_1 (1010)", "LED_2 (1000)", "LED_3 (1001)")
+        val labels = listOf("A", "B", "C")
 
-        fun worldToCanvas(p: android.graphics.PointF, cw: Float, ch: Float): android.graphics.PointF {
-            // Increase this so large radii still fit
-            val halfExtent = 5f   // covers from -30 to +30 in world units
-            val sx = cw / (halfExtent * 2f)
-            val sy = ch / (halfExtent * 2f)
-            val scale = minOf(sx, sy)
-            val cx = cw / 2f
-            val cy = ch / 2f
-            return android.graphics.PointF(cx + p.x * scale, cy - p.y * scale)
-        }
-
-        ledWorld.forEachIndexed { i, p ->
-            val c = worldToCanvas(p, w, h)
-            canvas.drawCircle(c.x, c.y, radius, paintLed)
-            canvas.drawText(ledLabels[i], c.x, c.y - radius - 12f, textPaint)
+        ledWorld.forEachIndexed { i, pW ->
+            val pC = worldToCanvas(pW.x, pW.y, w, h)
+            canvas.drawCircle(pC.x, pC.y, radiusPx, paintLed)
+            canvas.drawText(labels[i], pC.x, pC.y - radiusPx - 12f, textPaint)
         }
     }
 
     private fun drawUser(canvas: Canvas) {
-        userPoint?.let { p ->
-            // Translate from pixel coords (where (0,0) is center)
-            val cx = width  / 2f
-            val cy = height / 2f
-            val x = cx + p.x.toFloat()
-            val y = cy - p.y.toFloat()  // invert Y if needed
-
-            // Draw an “X” at the user position
+        val w = width.toFloat()
+        val h = height.toFloat()
+        userPoint?.let { pW ->
+            val pC = worldToCanvas(pW.x.toFloat(), pW.y.toFloat(), w, h)
             val s = 30f
-            canvas.drawLine(x - s, y - s, x + s, y + s, paintUser)
-            canvas.drawLine(x - s, y + s, x + s, y - s, paintUser)
+            canvas.drawLine(pC.x - s, pC.y - s, pC.x + s, pC.y + s, paintUser)
+            canvas.drawLine(pC.x - s, pC.y + s, pC.x + s, pC.y - s, paintUser)
+        }
+    }
+
+    private fun drawFooter(canvas: Canvas, worldRect: RectF) {
+        val pad = 24f
+        val line = 44f
+
+        // Left aligned, just below the world rect
+        val startX = pad
+        var y = worldRect.bottom + pad + footerPaint.textSize
+
+        val (ux, uy) = footerUser ?: (0.0 to 0.0)
+        val d1 = footerD1
+        val d2 = footerD2
+        val d3 = footerD3
+
+        fun fmt(v: Double) = String.format(Locale.US, "%.4f", v)
+        fun fmtD(v: Double?) = if (v == null || v.isNaN()) "N/A" else String.format(Locale.US, "%.4f", v)
+
+        val lines = listOf(
+            "User Position: {x=${fmt(ux)}, y=${fmt(uy)}}",
+            "LED A (1000): {${fmtD(d1)}}",
+            "LED B (1001): {${fmtD(d2)}}",
+            "LED C (1010): {${fmtD(d3)}}"
+        )
+
+        for (t in lines) {
+            canvas.drawText(t, startX, y, footerPaint)
+            y += line
         }
     }
 }

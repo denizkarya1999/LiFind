@@ -12,7 +12,6 @@ import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
 import android.preference.PreferenceManager
-import android.util.Log
 import android.util.SparseIntArray
 import android.view.Surface
 import android.view.TextureView
@@ -128,6 +127,20 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        viewBinding.TakeSnapshotButton.setOnClickListener {
+            takeSnapshotAndProcessOnce()
+        }
+
+        viewBinding.clearButton.setOnClickListener {
+            // 1) Clean overlay
+            viewBinding.processedFrameView.setImageDrawable(null)
+            viewBinding.processedFrameView.visibility = View.GONE
+            viewBinding.processedFrameView.invalidate()
+
+            // 2) Restart camera preview
+            restartCamera()
+        }
+
         viewBinding.aboutButton.setOnClickListener {
             startActivity(Intent(this, AboutXameraActivity::class.java))
         }
@@ -217,6 +230,67 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    private fun restartCamera() {
+        try {
+            // Stop and fully reset the camera pipeline
+            cameraHelper.closeCamera()
+            cameraHelper.stopBackgroundThread()
+        } catch (_: Throwable) { /* ignore */ }
+
+        // Start threads again
+        cameraHelper.startBackgroundThread()
+
+        // Re-open camera or set listener if the TextureView isn't ready yet
+        if (allPermissionsGranted()) {
+            if (viewBinding.viewFinder.isAvailable) {
+                cameraHelper.openCamera()
+            } else {
+                viewBinding.viewFinder.surfaceTextureListener = textureListener
+            }
+        } else {
+            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun takeSnapshotAndProcessOnce() {
+        val vp = videoProcessor ?: return
+        val btn = viewBinding.TakeSnapshotButton
+
+        // Always start with a clean processed view
+        viewBinding.processedFrameView.setImageDrawable(null)
+        viewBinding.processedFrameView.visibility = View.GONE
+        viewBinding.processedFrameView.invalidate()
+
+        // UI debounce
+        btn.isEnabled = false
+        Toast.makeText(this, "Capturing snapshot…", Toast.LENGTH_SHORT).show()
+
+        // get a single frame from the preview
+        val snapshot = viewBinding.viewFinder.bitmap
+        if (snapshot == null) {
+            btn.isEnabled = true
+            Toast.makeText(this, "No frame available yet.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // run your current single-frame pipeline
+        vp.processFrame(snapshot) { processed ->
+            processed?.let { (annotated, _) ->
+                // briefly show it
+                viewBinding.processedFrameView.setImageBitmap(annotated)
+                viewBinding.processedFrameView.visibility = View.VISIBLE
+            }
+
+            // use your EXISTING log-writer (unchanged)
+            vp.writeLedDistLogToFile()
+
+            cameraHelper.closeCamera()
+            btn.isEnabled = true
+        }
+    }
+
 
     override fun onResume() {
         super.onResume()

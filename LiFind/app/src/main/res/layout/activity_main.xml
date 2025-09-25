@@ -129,6 +129,17 @@
             android:text="-"
             android:textColor="@color/darkBlue"
             android:textSize="24sp" />
+
+        <Button
+            android:id="@+id/clearButton"
+            android:layout_width="60dp"
+            android:layout_height="60dp"
+            android:layout_marginBottom="16dp"
+            android:backgroundTint="@color/red"
+            android:elevation="2dp"
+            android:text="C"
+            android:textColor="@color/white"
+            android:textSize="24sp" />
     </LinearLayout>
 
     <!-- Bottom Controls, including Upload and View Map Buttons -->
@@ -140,6 +151,16 @@
         android:gravity="center"
         android:layout_gravity="center_horizontal|bottom"
         android:layout_marginBottom="50dp">
+
+        <Button
+            android:id="@+id/TakeSnapshotButton"
+            android:layout_width="110dp"
+            android:layout_height="110dp"
+            android:backgroundTint="@color/green"
+            android:elevation="2dp"
+            android:text="Take Snapshot"
+            android:textColor="@android:color/white"
+            android:layout_marginEnd="16dp" />
 
         <Button
             android:id="@+id/startProcessingButton"

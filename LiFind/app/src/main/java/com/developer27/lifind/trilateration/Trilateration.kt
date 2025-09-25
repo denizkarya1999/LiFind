@@ -1,5 +1,7 @@
-import kotlin.math.abs
+
+import kotlin.math.max
 import kotlin.math.pow
+import kotlin.math.sqrt
 
 object Trilateration {
     // Legacy fixed LED positions for backward-compatibility
@@ -7,12 +9,22 @@ object Trilateration {
     private val LED_B = Pair(-2.0, -2.0)
     private val LED_C = Pair(2.0, -2.0)
 
-    /**
-     * New, dynamic API:
-     * @param ledCoords  exactly three (x,y) world-coordinates of your LEDs
-     * @param distances  exactly three distances from those LEDs
-     * @return the (x,y) solution or (0,0) if none converged
-     */
+    // ---- Config (no callsite change needed) ----
+    @Volatile var interpretDistancesAsRadial3D: Boolean = false
+    @Volatile var sensorHeight: Double = 0.0
+
+    /** Optional: call once during setup if your 'distances' are raw 3D radii and camera is H above the LED plane. */
+    fun setDistancesAreRadial3D(enabled: Boolean, height: Double) {
+        interpretDistancesAsRadial3D = enabled
+        sensorHeight = height
+    }
+
+    private fun toPlanarIfNeeded(distances: List<Double>): List<Double> {
+        if (!interpretDistancesAsRadial3D || sensorHeight <= 0.0) return distances
+        val h2 = sensorHeight * sensorHeight
+        return distances.map { d -> sqrt(max(0.0, d * d - h2)) }
+    }
+
     fun solve(
         ledCoords: List<Pair<Double, Double>>,
         distances: List<Double>
@@ -20,45 +32,39 @@ object Trilateration {
         require(ledCoords.size == 3 && distances.size == 3) {
             "Trilateration.solve requires exactly 3 LED positions and 3 distances"
         }
+
         val (A, B, C) = ledCoords
-        val (DA, DB, DC) = distances
-        fun equations(x: Double, y: Double): Pair<Double, Double> {
-            val eqA = (x - A.first).pow(2) + (y - A.second).pow(2) - DA.pow(2)
-            val eqB = (x - B.first).pow(2) + (y - B.second).pow(2) - DB.pow(2)
-            val eqC = (x - C.first).pow(2) + (y - C.second).pow(2) - DC.pow(2)
-            return Pair(eqA - eqB, eqA - eqC)
-        }
-        val guesses = listOf(
-            A, B, C,
-            Pair((A.first + B.first)/2, (A.second + B.second)/2),
-            Pair((B.first + C.first)/2, (B.second + C.second)/2),
-            Pair((C.first + A.first)/2, (C.second + A.second)/2)
-        )
-        val solutions = mutableListOf<Pair<Double, Double>>()
-        for ((gx, gy) in guesses) {
-            var x = gx; var y = gy; var converged = false
-            for (i in 0 until 100) {
-                val (f1, f2) = equations(x, y)
-                val h = 1e-5
-                val fx1 = (equations(x + h, y).first - f1) / h
-                val fx2 = (equations(x, y + h).first - f1) / h
-                val fy1 = (equations(x + h, y).second - f2) / h
-                val fy2 = (equations(x, y + h).second - f2) / h
-                val det = fx1 * fy2 - fx2 * fy1
-                if (abs(det) < 1e-12) break
-                val dx = (-f1*fy2 + f2*fx2) / det
-                val dy = (-fx1*f2 + fy1*f1) / det
-                x += dx; y += dy
-                if (abs(dx) < 1e-6 && abs(dy) < 1e-6) { converged = true; break }
-            }
-            if (converged && solutions.none { (sx, sy) -> abs(sx - x) < 1e-3 && abs(sy - y) < 1e-3 }) {
-                solutions.add(Pair(x, y))
-            }
-        }
-        return solutions.firstOrNull() ?: Pair(0.0, 0.0)
+        val (Ax, Ay) = A
+        val (Bx, By) = B
+        val (Cx, Cy) = C
+
+        // Radial (3D) -> planar (XY) using fixed height H = 15
+        val H = 15.0
+        val h2 = H * H
+        val (dA, dB, dC) = distances
+        val DA = sqrt(dA.pow(2) - H.pow(2))
+        val DB = sqrt(dB.pow(2) - H.pow(2))
+        val DC = sqrt(dC.pow(2) - H.pow(2))
+
+        // From: (|p - A|^2 - DA^2) = (|p - B|^2 - DB^2) and (|p - A|^2 - DA^2) = (|p - C|^2 - DC^2)
+        // Linear system: a1*x + b1*y = c1 ; a2*x + b2*y = c2
+        val a1 = 2.0 * (Bx - Ax)
+        val b1 = 2.0 * (By - Ay)
+        val c1 = (DA * DA - DB * DB) - (Ax * Ax + Ay * Ay) + (Bx * Bx + By * By)
+
+        val a2 = 2.0 * (Cx - Ax)
+        val b2 = 2.0 * (Cy - Ay)
+        val c2 = (DA * DA - DC * DC) - (Ax * Ax + Ay * Ay) + (Cx * Cx + Cy * Cy)
+
+        val det = a1 * b2 - a2 * b1
+        if (kotlin.math.abs(det) < 1e-12) return 0.0 to 0.0  // degenerate / collinear
+
+        val x = (c1 * b2 - c2 * b1) / det
+        val y = (a1 * c2 - a2 * c1) / det
+        return x to y
     }
 
-    /** Legacy API */
+    /** Legacy API — unchanged */
     fun solve(DA: Double, DB: Double, DC: Double): Pair<Double, Double> =
         solve(listOf(LED_A, LED_B, LED_C), listOf(DA, DB, DC))
 }
