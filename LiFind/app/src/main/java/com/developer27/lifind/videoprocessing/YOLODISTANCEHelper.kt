@@ -3,7 +3,6 @@ package com.developer27.lifind.videoprocessing
 import android.content.Context
 import android.graphics.Bitmap
 import org.tensorflow.lite.Interpreter
-import java.io.File
 import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
@@ -282,116 +281,5 @@ object YOLODISTANCEHelper {
             }
         }
         return kept
-    }
-
-    /** Returns the single best detection (after NMS), or null. */
-    fun parseTFLiteOneBox(
-        raw: Array<Array<FloatArray>>,
-        confidenceThreshold: Float,
-        multiLabelPerBox: Boolean,
-        expectedClasses: Int = 0,     // <=0 -> auto K
-        classAgnosticNms: Boolean = true
-    ): DetectionResult? {
-        val dets = parseTFLite(
-            raw = raw,
-            confidenceThreshold = confidenceThreshold,
-            classAgnosticNms = classAgnosticNms,
-            multiLabelPerBox = multiLabelPerBox,
-            expectedClasses = expectedClasses
-        )
-        return dets.firstOrNull()
-    }
-
-    fun logPerClassScores(
-        raw: Array<Array<FloatArray>>,
-        expectedClasses: Int = 0
-    ): File? {
-        if (raw.isEmpty() || raw[0].isEmpty()) return null
-
-        val b = raw[0]
-        val d1 = b.size
-        val d2 = b[0].size
-
-        val plausibleMaxChannels = 512
-        val d1LooksLikeChannels = d1 in 6..plausibleMaxChannels && d2 >= d1
-        val d2LooksLikeChannels = d2 in 6..plausibleMaxChannels && d1 >= d2
-
-        val channels: Int
-        val numPoints: Int
-        val get: (c: Int, i: Int) -> Float
-
-        when {
-            d1LooksLikeChannels && !d2LooksLikeChannels -> {
-                channels = d1; numPoints = d2; get = { c, i -> b[c][i] } // CHW
-            }
-            d2LooksLikeChannels && !d1LooksLikeChannels -> {
-                channels = d2; numPoints = d1; get = { c, i -> b[i][c] } // HWC
-            }
-            else -> {
-                if (d1 <= d2) {
-                    channels = d1; numPoints = d2; get = { c, i -> b[c][i] } // assume CHW
-                } else {
-                    channels = d2; numPoints = d1; get = { c, i -> b[i][c] } // assume HWC
-                }
-            }
-        }
-
-        // Auto-detect K and objectness (same logic as parseTFLite)
-        var k = expectedClasses
-        val hasObjectness: Boolean = run {
-            if (k > 0 && (channels == 4 + k || channels == 5 + k)) {
-                channels == 5 + k
-            } else {
-                val kNoObj = channels - 4
-                val kWithObj = channels - 5
-                when {
-                    kNoObj in 1..plausibleMaxChannels -> { k = kNoObj; false }
-                    kWithObj in 1..plausibleMaxChannels -> { k = kWithObj; true }
-                    else -> return null
-                }
-            }
-        }
-        val clsStart = if (hasObjectness) 5 else 4
-        if (k <= 0) return null
-
-        // Max confidence per class
-        val perClassMax = FloatArray(k) { 0f }
-        for (i in 0 until numPoints) {
-            val obj = if (hasObjectness) get(4, i) else 1f
-            for (c in 0 until k) {
-                val p = get(clsStart + c, i)
-                val conf = if (hasObjectness) obj * p else p
-                if (conf > perClassMax[c]) perClassMax[c] = conf
-            }
-        }
-
-        // Build header/line
-        val header = buildString {
-            append("timestamp")
-            for (c in 0 until k) append(",class_").append(c)
-        }
-        val dateStr = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
-            .format(java.util.Date())
-        val line = buildString {
-            append(dateStr)
-            for (c in 0 until k) {
-                append(',').append(String.format(java.util.Locale.US, "%.4f", perClassMax[c]))
-            }
-        }
-
-        // Overwrite file every call
-        val docsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOCUMENTS)
-        if (!docsDir.exists()) docsDir.mkdirs()
-        val outFile = java.io.File(docsDir, "LiFind_DistanceClassPredictions.txt")
-
-        return try {
-            java.io.PrintWriter(java.io.BufferedWriter(java.io.FileWriter(outFile, /* append = */ false))).use { out ->
-                out.println(header)
-                out.println(line)
-            }
-            outFile
-        } catch (_: Throwable) {
-            null
-        }
     }
 }

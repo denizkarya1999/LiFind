@@ -188,7 +188,6 @@ class VideoProcessor(private val context: Context) {
         synchronized(distInterp) {
             distInterp.run(tensorImage.buffer, distHead)
         }
-        YOLODISTANCEHelper.logPerClassScores(raw = distHead, expectedClasses = 0)
         val distDets: List<DetectionResult> =
             YOLODISTANCEHelper.parseTFLite(
                 raw = distHead,
