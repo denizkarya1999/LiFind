@@ -361,12 +361,7 @@ class MainActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
 
-                val file = writeLedDistLogToFileFromInputs(d1, d2, d3)
-                if (file != null) {
-                    Toast.makeText(this, "Saved to ${file.absolutePath}", Toast.LENGTH_LONG).show()
-                } else {
-                    Toast.makeText(this, "Failed to save distances.", Toast.LENGTH_SHORT).show()
-                }
+                writeLedDistLogToFileFromInputs(d1, d2, d3)
             }
             .show()
     }
