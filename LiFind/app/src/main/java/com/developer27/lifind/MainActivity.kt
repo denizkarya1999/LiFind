@@ -327,17 +327,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         val led1Et = EditText(this).apply {
-            hint = "LED 1 distance (cm)"
+            hint = "LED A Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText("") // optionally prefill e.g., "9"
         }
         val led2Et = EditText(this).apply {
-            hint = "LED 2 distance (cm)"
+            hint = "LED B Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText("") // optionally prefill e.g., "12"
         }
         val led3Et = EditText(this).apply {
-            hint = "LED 3 distance (cm)"
+            hint = "LED C Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText("") // optionally prefill e.g., "15"
         }
