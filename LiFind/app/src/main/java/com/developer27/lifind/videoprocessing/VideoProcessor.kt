@@ -50,8 +50,8 @@ object Settings {
         var current: Mode = Mode.YOLO
     }
     object Inference {
-        var confidenceThreshold: Float = 0.95f
-        var iouThreshold: Float = 0.45f
+        var confidenceThreshold: Float = 0.45f
+        var iouThreshold: Float = 0.25f
         var classAgnosticNms: Boolean = false
         var multiLabelPerBox: Boolean = true
         var topPerClass: Int = 1

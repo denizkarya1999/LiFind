@@ -15,6 +15,8 @@ import androidx.appcompat.app.AppCompatActivity
 import org.opencv.core.Point
 import java.io.File
 import java.util.Locale
+import kotlin.math.max
+import kotlin.math.min
 
 class MapActivity : AppCompatActivity() {
     private var LED_1: Point = Point(0.0, 0.0)
@@ -50,7 +52,7 @@ class MapActivity : AppCompatActivity() {
 
         // 4) Show map; pass user position in *world* coords and footer info
         val mapView = MapGridView(this).apply {
-            setUserPixelPosition(USER_POS.first, USER_POS.second)
+            setUserPixelPosition(USER_POS.first, USER_POS.second) // world → compressed to 0..100 internally (with clamping at edges)
             setFooterInfo(USER_POS, LED_1_Distance, LED_2_Distance, LED_3_Distance)
         }
         setContentView(mapView)
@@ -97,6 +99,29 @@ class MapGridView @JvmOverloads constructor(
     private val extentWorld = 30f
     private val halfExtent = extentWorld / 2f
 
+    // ---- Compressed drawing space: 0..100 on both axes (without changing canvas size) ----
+    private val coordMax = 100f
+    private var userPoint100: PointF? = null // compressed [0..100] coords
+    private var userRawWorld: PointF? = null // original world coords (for footer/off-map label)
+
+    // Convert original world (-halfExtent..+halfExtent) -> [0..100]
+    private fun worldTo100(v: Float): Float = ((v + halfExtent) / extentWorld) * coordMax
+
+    // Convert [0..100] -> world (-halfExtent..+halfExtent) then to canvas
+    private fun hundredToCanvas(px100: Float, py100: Float, cw: Float, ch: Float): PointF {
+        val wx = (px100 / coordMax) * extentWorld - halfExtent
+        val wy = (py100 / coordMax) * extentWorld - halfExtent
+        return worldToCanvas(wx, wy, cw, ch)
+    }
+
+    // Clamp a [0..100] point to edges and report whether it was out-of-bounds
+    private fun clampPoint100(p: PointF): Pair<PointF, Boolean> {
+        val cx = min(max(p.x, 0f), coordMax)
+        val cy = min(max(p.y, 0f), coordMax)
+        val oob = (p.x < 0f || p.x > coordMax || p.y < 0f || p.y > coordMax)
+        return PointF(cx, cy) to oob
+    }
+
     // ---- Paints ----
     private val paintGrid = Paint().apply {
         color = Color.LTGRAY
@@ -135,21 +160,29 @@ class MapGridView @JvmOverloads constructor(
         isAntiAlias = true
         textAlign = Paint.Align.LEFT
     }
+    private val badgePaint = Paint().apply {
+        color = Color.RED
+        textSize = 36f
+        isAntiAlias = true
+        textAlign = Paint.Align.LEFT
+    }
 
     // ---- Data ----
-    private var userPoint: Point? = null // stored as *world* coords (x,y)
     private var footerUser: Pair<Double, Double>? = null
     private var footerD1: Double? = null
     private var footerD2: Double? = null
     private var footerD3: Double? = null
 
-    /** Treats inputs as *world* coordinates (name kept for compatibility). */
+    /** Accept world coords; store raw, and compressed (with possible clamping later on draw). */
     fun setUserPixelPosition(x: Double, y: Double) {
-        userPoint = Point(x, y)
+        userRawWorld = PointF(x.toFloat(), y.toFloat())
+        val x100 = worldTo100(x.toFloat())
+        val y100 = worldTo100(y.toFloat())
+        userPoint100 = PointF(x100, y100)
         invalidate()
     }
 
-    /** Footer info: user position + distances for LED1..3 */
+    /** Footer info: user position + distances for LED1..3 (kept in world units). */
     fun setFooterInfo(userPos: Pair<Double, Double>, d1: Double, d2: Double, d3: Double) {
         footerUser = userPos
         footerD1 = d1
@@ -241,6 +274,7 @@ class MapGridView @JvmOverloads constructor(
         val h = height.toFloat()
         val radiusPx = 30f
 
+        // Original world coordinates of LEDs
         val ledWorld = listOf(
             PointF( 0f,  2f), // LED_1
             PointF(-2f, -2f), // LED_2
@@ -249,7 +283,11 @@ class MapGridView @JvmOverloads constructor(
         val labels = listOf("A", "B", "C")
 
         ledWorld.forEachIndexed { i, pW ->
-            val pC = worldToCanvas(pW.x, pW.y, w, h)
+            // Compress to [0..100] then to canvas
+            val x100 = worldTo100(pW.x)
+            val y100 = worldTo100(pW.y)
+            val (clamped, _) = clampPoint100(PointF(x100, y100))
+            val pC = hundredToCanvas(clamped.x, clamped.y, w, h)
             canvas.drawCircle(pC.x, pC.y, radiusPx, paintLed)
             canvas.drawText(labels[i], pC.x, pC.y - radiusPx - 12f, textPaint)
         }
@@ -258,11 +296,34 @@ class MapGridView @JvmOverloads constructor(
     private fun drawUser(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
-        userPoint?.let { pW ->
-            val pC = worldToCanvas(pW.x.toFloat(), pW.y.toFloat(), w, h)
-            val s = 30f
-            canvas.drawLine(pC.x - s, pC.y - s, pC.x + s, pC.y + s, paintUser)
-            canvas.drawLine(pC.x - s, pC.y + s, pC.x + s, pC.y - s, paintUser)
+        val s = 30f // size of the X marker
+        val p100 = userPoint100 ?: return
+
+        val (clamped, oob) = clampPoint100(p100)
+        val pC = hundredToCanvas(clamped.x, clamped.y, w, h)
+
+        // draw the "X" at the (possibly clamped) location
+        canvas.drawLine(pC.x - s, pC.y - s, pC.x + s, pC.y + s, paintUser)
+        canvas.drawLine(pC.x - s, pC.y + s, pC.x + s, pC.y - s, paintUser)
+
+        if (oob) {
+            // Add a small "off-map" badge with the raw world coords
+            val rw = userRawWorld
+            if (rw != null) {
+                val offText = "off-map (x=${fmt(rw.x.toDouble())}, y=${fmt(rw.y.toDouble())})"
+                // Shift badge slightly inward from the edge so it’s readable
+                val dx = when {
+                    clamped.x <= 0f -> 12f
+                    clamped.x >= coordMax -> -badgePaint.measureText(offText) - 12f
+                    else -> -badgePaint.measureText(offText) / 2f
+                }
+                val dy = when {
+                    clamped.y <= 0f -> 36f
+                    clamped.y >= coordMax -> -12f
+                    else -> -12f
+                }
+                canvas.drawText(offText, pC.x + dx, pC.y + dy, badgePaint)
+            }
         }
     }
 
@@ -279,9 +340,6 @@ class MapGridView @JvmOverloads constructor(
         val d2 = footerD2
         val d3 = footerD3
 
-        fun fmt(v: Double) = String.format(Locale.US, "%.4f", v)
-        fun fmtD(v: Double?) = if (v == null || v.isNaN()) "N/A" else String.format(Locale.US, "%.4f", v)
-
         val lines = listOf(
             "User Position: {x=${fmt(ux)}, y=${fmt(uy)}}",
             "LED A (1000): {${fmtD(d1)}}",
@@ -294,4 +352,7 @@ class MapGridView @JvmOverloads constructor(
             y += line
         }
     }
+
+    private fun fmt(v: Double) = String.format(Locale.US, "%.4f", v)
+    private fun fmtD(v: Double?) = if (v == null || v.isNaN()) "N/A" else String.format(Locale.US, "%.4f", v)
 }

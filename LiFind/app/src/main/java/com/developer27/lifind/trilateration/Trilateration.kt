@@ -42,9 +42,9 @@ object Trilateration {
         val H = 15.0
         val h2 = H * H
         val (dA, dB, dC) = distances
-        val DA = sqrt(dA.pow(2) - H.pow(2))
-        val DB = sqrt(dB.pow(2) - H.pow(2))
-        val DC = sqrt(dC.pow(2) - H.pow(2))
+        val DA = sqrt(max(0.0, dA.pow(2) - H.pow(2)))
+        val DB = sqrt(max(0.0, dB.pow(2) - H.pow(2)))
+        val DC = sqrt(max(0.0, dC.pow(2) - H.pow(2)))
 
         // From: (|p - A|^2 - DA^2) = (|p - B|^2 - DB^2) and (|p - A|^2 - DA^2) = (|p - C|^2 - DC^2)
         // Linear system: a1*x + b1*y = c1 ; a2*x + b2*y = c2
