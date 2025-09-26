@@ -217,6 +217,7 @@ class MainActivity : AppCompatActivity() {
         viewBinding.startProcessingButton.backgroundTintList =
             ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
+        viewBinding.processedFrameView.setImageBitmap(null)
     }
 
     private fun stopProcessingAndRecording() {
@@ -228,6 +229,7 @@ class MainActivity : AppCompatActivity() {
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.processedFrameView.setImageBitmap(null)
         videoProcessor?.writeLedDistLogToFile()
+        openMapActivity()
     }
 
     private fun processFrameWithVideoProcessor() {
