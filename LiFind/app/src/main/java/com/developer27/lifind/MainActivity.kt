@@ -11,15 +11,23 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.preference.PreferenceManager
+import android.text.InputType
+import android.util.Log
 import android.util.SparseIntArray
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
@@ -27,6 +35,10 @@ import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.trilateration.MapActivity
 import com.developer27.lifind.videoprocessing.VideoProcessor
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileWriter
+import java.io.PrintWriter
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -129,6 +141,10 @@ class MainActivity : AppCompatActivity() {
 
         viewBinding.TakeSnapshotButton.setOnClickListener {
             takeSnapshotAndProcessOnce()
+        }
+
+        viewBinding.hardCodedDistancesButton.setOnClickListener {
+            showHardCodedDistancesDialog()
         }
 
         viewBinding.clearButton.setOnClickListener {
@@ -291,6 +307,91 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showHardCodedDistancesDialog() {
+        // Container with simple vertical form
+        val container = ScrollView(this).apply {
+            val pad = (16 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val led1Et = EditText(this).apply {
+            hint = "LED 1 distance (cm)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText("") // optionally prefill e.g., "9"
+        }
+        val led2Et = EditText(this).apply {
+            hint = "LED 2 distance (cm)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText("") // optionally prefill e.g., "12"
+        }
+        val led3Et = EditText(this).apply {
+            hint = "LED 3 distance (cm)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText("") // optionally prefill e.g., "15"
+        }
+
+        form.addView(led1Et)
+        form.addView(led2Et)
+        form.addView(led3Et)
+        container.addView(form)
+
+        AlertDialog.Builder(this)
+            .setTitle("Enter LED distances (cm)")
+            .setView(container)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save") { _, _ ->
+                val d1 = led1Et.text.toString().trim().toDoubleOrNull()
+                val d2 = led2Et.text.toString().trim().toDoubleOrNull()
+                val d3 = led3Et.text.toString().trim().toDoubleOrNull()
+
+                if (d1 == null || d2 == null || d3 == null) {
+                    Toast.makeText(this, "Please enter valid numbers for all three distances.", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+
+                val file = writeLedDistLogToFileFromInputs(d1, d2, d3)
+                if (file != null) {
+                    Toast.makeText(this, "Saved to ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "Failed to save distances.", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .show()
+    }
+
+    private fun writeLedDistLogToFileFromInputs(d1Cm: Double, d2Cm: Double, d3Cm: Double): File? {
+        fun fmtDistanceBraced(v: Double?): String =
+            if (v == null) "{N/A}" else "{${v.toInt()} CM}"
+
+        val name = "LiFind_Log.txt"
+        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        if (!docsDir.exists()) docsDir.mkdirs()
+
+        val outFile = File(docsDir, name)
+        return try {
+            PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
+                out.println("LED_1 -> Coordinates: {x=0, y=2} - Distance: ${fmtDistanceBraced(d1Cm)}")
+                out.println("LED_2 -> Coordinates: {x=2, y=-2} - Distance: ${fmtDistanceBraced(d2Cm)}")
+                out.println("LED_3 -> Coordinates: {x=-2, y=-2} - Distance: ${fmtDistanceBraced(d3Cm)}")
+            }
+            outFile
+        } catch (t: Throwable) {
+            Log.e("LedDistLogger", "Failed to write log", t)
+            null
+        }
+    }
 
     override fun onResume() {
         super.onResume()
