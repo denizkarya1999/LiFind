@@ -362,6 +362,8 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 writeLedDistLogToFileFromInputs(d1, d2, d3)
+
+                openMapActivity()
             }
             .show()
     }
