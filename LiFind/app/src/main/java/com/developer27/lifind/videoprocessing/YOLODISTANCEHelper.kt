@@ -71,7 +71,7 @@ object YOLODISTANCEHelper {
 
     // ------------- Labels / utilities -------------
 
-    private val labels = arrayOf("30","27","24","21","18","15","12","9","6","3")
+    private val labels = arrayOf("3","6","9","12","15","18","21","24","27","30")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"
