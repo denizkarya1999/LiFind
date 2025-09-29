@@ -17,7 +17,7 @@ import java.nio.channels.FileChannel
 object YOLOLEDHelper {
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_iso_led_100_yolo_11s_ultralytics_hub.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_iso_led_100_yolo_11m_google_collab.tflite"
 
     @Volatile
     private var interpreter: Interpreter? = null
@@ -108,11 +108,6 @@ object YOLOLEDHelper {
      * expectedClasses: how many classes your model has (e.g., 3)
      * hasObjectness:   true if layout is [x,y,w,h,obj,classes...], false if [x,y,w,h,classes...]
      */
-    /**
-     * Robust YOLO TFLite parser that supports heads with or without an "obj" column.
-     *
-     * expectedClasses: how many classes your model has (e.g., 3)
-     */
     fun parseTFLite(
         raw: Array<Array<FloatArray>>,
         confidenceThreshold: Float,
@@ -122,28 +117,29 @@ object YOLOLEDHelper {
     ): List<DetectionResult> {
 
         val b = raw[0]
-        val d1 = b.size
-        val d2 = b[0].size
+        val d1 = b.size           // first 2D dim
+        val d2 = b[0].size        // second 2D dim
 
-        val channels: Int
-        val numPoints: Int
-        val get: (c: Int, i: Int) -> Float
+        // Robust layout detection:
+        // Prefer the dimension that matches 4+K (no obj) or 5+K (with obj).
+        val cNoObj = 4 + expectedClasses
+        val cWithObj = 5 + expectedClasses
 
-        // Layout detect: CHW [1,C,N] vs HWC [1,N,C]
-        if (d1 <= 10 && d2 >= d1) { // CHW
-            channels = d1
-            numPoints = d2
-            get = { c, i -> b[c][i] }
-        } else {                    // HWC
-            channels = d2
-            numPoints = d1
-            get = { c, i -> b[i][c] }
+        val isCHW = when {
+            d1 == cNoObj || d1 == cWithObj -> true          // [1, C, N] -> channels in d1
+            d2 == cNoObj || d2 == cWithObj -> false         // [1, N, C] -> channels in d2
+            // Fallback to legacy heuristic only if neither side matches
+            d1 <= 10 && d2 >= d1 -> true
+            else -> false
         }
 
-        // Auto-detect objectness
+        val channels = if (isCHW) d1 else d2
+        val numPoints = if (isCHW) d2 else d1
+
+        // Determine presence of objectness based on channels
         val hasObjectness = when (channels) {
-            4 + expectedClasses -> false
-            5 + expectedClasses -> true
+            cNoObj    -> false
+            cWithObj  -> true
             else -> {
                 android.util.Log.e(
                     "YOLOParser",
@@ -154,84 +150,202 @@ object YOLOLEDHelper {
         }
 
         val clsStart = if (hasObjectness) 5 else 4
-        val candidates = ArrayList<DetectionResult>(numPoints * (if (multiLabelPerBox) 2 else 1))
+        val invInput = 1f / INPUT_SIZE
+        val confThresh = confidenceThreshold
 
-        for (i in 0 until numPoints) {
-            val x = get(0, i)
-            val y = get(1, i)
-            val w = get(2, i)
-            val h = get(3, i)
-            val obj = if (hasObjectness) get(4, i) else 1f
+        // Pre-size to minimize resizes on large heads (YOLO 11M+)
+        val est = if (multiLabelPerBox) (numPoints * 2.0f).toInt() else numPoints
+        val candidates = ArrayList<DetectionResult>(est.coerceIn(16, 131072))
 
-            // Normalize boxes if they look like pixels
-            val cxN = if (x > 1.5f) x / INPUT_SIZE else x
-            val cyN = if (y > 1.5f) y / INPUT_SIZE else y
-            val wN = if (w > 1.5f) w / INPUT_SIZE else w
-            val hN = if (h > 1.5f) h / INPUT_SIZE else h
+        fun clamp01(v: Float): Float = if (v < 0f) 0f else if (v > 1f) 1f else v
 
-            if (multiLabelPerBox) {
-                for (c in 0 until expectedClasses) {
-                    val clsP = get(clsStart + c, i)
-                    val conf = if (hasObjectness) obj * clsP else clsP
-                    if (conf >= confidenceThreshold) {
+        if (isCHW) {
+            // CHW: [1, C, N] => b[c][i]
+            for (i in 0 until numPoints) {
+                val x = b[0][i]; val y = b[1][i]; val w = b[2][i]; val h = b[3][i]
+                val obj = if (hasObjectness) b[4][i] else 1f
+
+                // Safe early prune when objectness is present
+                if (hasObjectness && obj < confThresh) continue
+
+                val cxN = if (x > 1.5f) x * invInput else x
+                val cyN = if (y > 1.5f) y * invInput else y
+                val wN  = if (w > 1.5f) w * invInput else w
+                val hN  = if (h > 1.5f) h * invInput else h
+
+                val xc = clamp01(cxN)
+                val yc = clamp01(cyN)
+                val ww = clamp01(wN.coerceAtLeast(0f))
+                val hh = clamp01(hN.coerceAtLeast(0f))
+
+                if (multiLabelPerBox) {
+                    val base = if (hasObjectness) obj else 1f
+                    for (c in 0 until expectedClasses) {
+                        val clsP = b[clsStart + c][i]
+                        val conf = if (hasObjectness) base * clsP else clsP
+                        if (conf >= confThresh) {
+                            candidates.add(
+                                DetectionResult(
+                                    xCenter = xc, yCenter = yc, width = ww, height = hh,
+                                    confidence = conf, classId = c
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    var bestC = 0
+                    var bestP = b[clsStart][i]
+                    for (c in 1 until expectedClasses) {
+                        val p = b[clsStart + c][i]
+                        if (p > bestP) { bestP = p; bestC = c }
+                    }
+                    val conf = if (hasObjectness) obj * bestP else bestP
+                    if (conf >= confThresh) {
                         candidates.add(
                             DetectionResult(
-                                xCenter = cxN.coerceIn(0f, 1f),
-                                yCenter = cyN.coerceIn(0f, 1f),
-                                width = wN.coerceIn(0f, 1f),
-                                height = hN.coerceIn(0f, 1f),
-                                confidence = conf,
-                                classId = c
+                                xCenter = xc, yCenter = yc, width = ww, height = hh,
+                                confidence = conf, classId = bestC
                             )
                         )
                     }
                 }
-            } else {
-                var bestC = 0
-                var bestP = get(clsStart, i)
-                for (c in 1 until expectedClasses) {
-                    val p = get(clsStart + c, i)
-                    if (p > bestP) {
-                        bestP = p; bestC = c
+            }
+        } else {
+            // HWC: [1, N, C] => b[i][c]
+            for (i in 0 until numPoints) {
+                val x = b[i][0]; val y = b[i][1]; val w = b[i][2]; val h = b[i][3]
+                val obj = if (hasObjectness) b[i][4] else 1f
+
+                if (hasObjectness && obj < confThresh) continue
+
+                val cxN = if (x > 1.5f) x * invInput else x
+                val cyN = if (y > 1.5f) y * invInput else y
+                val wN  = if (w > 1.5f) w * invInput else w
+                val hN  = if (h > 1.5f) h * invInput else h
+
+                val xc = clamp01(cxN)
+                val yc = clamp01(cyN)
+                val ww = clamp01(wN.coerceAtLeast(0f))
+                val hh = clamp01(hN.coerceAtLeast(0f))
+
+                if (multiLabelPerBox) {
+                    val base = if (hasObjectness) obj else 1f
+                    for (c in 0 until expectedClasses) {
+                        val clsP = b[i][clsStart + c]
+                        val conf = if (hasObjectness) base * clsP else clsP
+                        if (conf >= confThresh) {
+                            candidates.add(
+                                DetectionResult(
+                                    xCenter = xc, yCenter = yc, width = ww, height = hh,
+                                    confidence = conf, classId = c
+                                )
+                            )
+                        }
                     }
-                }
-                val conf = if (hasObjectness) obj * bestP else bestP
-                if (conf >= confidenceThreshold) {
-                    candidates.add(
-                        DetectionResult(
-                            xCenter = cxN.coerceIn(0f, 1f),
-                            yCenter = cyN.coerceIn(0f, 1f),
-                            width = wN.coerceIn(0f, 1f),
-                            height = hN.coerceIn(0f, 1f),
-                            confidence = conf,
-                            classId = bestC
+                } else {
+                    var bestC = 0
+                    var bestP = b[i][clsStart]
+                    for (c in 1 until expectedClasses) {
+                        val p = b[i][clsStart + c]
+                        if (p > bestP) { bestP = p; bestC = c }
+                    }
+                    val conf = if (hasObjectness) obj * bestP else bestP
+                    if (conf >= confThresh) {
+                        candidates.add(
+                            DetectionResult(
+                                xCenter = xc, yCenter = yc, width = ww, height = hh,
+                                confidence = conf, classId = bestC
+                            )
                         )
-                    )
+                    }
                 }
             }
         }
 
         if (candidates.isEmpty()) return emptyList()
 
-        // NMS (class-agnostic or per-class)
-        val iouThresh = Settings.Inference.iouThreshold
+        // Sort once by confidence (desc)
         candidates.sortByDescending { it.confidence }
-        val kept = ArrayList<DetectionResult>(candidates.size)
-        val removed = BooleanArray(candidates.size)
-        for (i in candidates.indices) {
-            if (removed[i])
-                continue
-            val a = candidates[i]
-            kept.add(a)
-            for (j in i + 1 until candidates.size) {
-                if (removed[j]) continue
-                val bDet = candidates[j]
-                if (!classAgnosticNms && a.classId != bDet.classId)
-                    continue
-                if (iou(a, bDet) > iouThresh)
-                    removed[j] = true
-            }
+
+        // Precompute xyxy + area once for fast IoU
+        val n = candidates.size
+        val x1 = FloatArray(n)
+        val y1 = FloatArray(n)
+        val x2 = FloatArray(n)
+        val y2 = FloatArray(n)
+        val area = FloatArray(n)
+
+        for (i in 0 until n) {
+            val d = candidates[i]
+            val hw = 0.5f * d.width
+            val hh = 0.5f * d.height
+            val xx1 = d.xCenter - hw
+            val yy1 = d.yCenter - hh
+            val xx2 = d.xCenter + hw
+            val yy2 = d.yCenter + hh
+            x1[i] = if (xx1 < 0f) 0f else xx1
+            y1[i] = if (yy1 < 0f) 0f else yy1
+            x2[i] = if (xx2 > 1f) 1f else xx2
+            y2[i] = if (yy2 > 1f) 1f else yy2
+            val wA = (x2[i] - x1[i]).coerceAtLeast(0f)
+            val hA = (y2[i] - y1[i]).coerceAtLeast(0f)
+            area[i] = wA * hA
         }
+
+        val iouThresh = Settings.Inference.iouThreshold
+        val removed = BooleanArray(n)
+        val kept = ArrayList<DetectionResult>(n)
+
+        fun iouQuick(i: Int, j: Int): Float {
+            val xx1 = if (x1[i] > x1[j]) x1[i] else x1[j]
+            val yy1 = if (y1[i] > y1[j]) y1[i] else y1[j]
+            val xx2 = if (x2[i] < x2[j]) x2[i] else x2[j]
+            val yy2 = if (y2[i] < y2[j]) y2[i] else y2[j]
+            val iw = xx2 - xx1
+            if (iw <= 0f) return 0f
+            val ih = yy2 - yy1
+            if (ih <= 0f) return 0f
+            val inter = iw * ih
+            val u = area[i] + area[j] - inter
+            return if (u > 0f) inter / u else 0f
+        }
+
+        if (classAgnosticNms) {
+            // Greedy global NMS
+            for (i in 0 until n) {
+                if (removed[i]) continue
+                kept.add(candidates[i])
+                for (j in i + 1 until n) {
+                    if (!removed[j] && iouQuick(i, j) > iouThresh) {
+                        removed[j] = true
+                    }
+                }
+            }
+        } else {
+            // Per-class NMS to reduce IoU checks
+            val buckets = Array(expectedClasses) { ArrayList<Int>() }
+            for (i in 0 until n) {
+                val cls = candidates[i].classId
+                if (cls in 0 until expectedClasses) buckets[cls].add(i) else buckets[0].add(i)
+            }
+            for (idxs in buckets) {
+                val m = idxs.size
+                for (aPos in 0 until m) {
+                    val i = idxs[aPos]
+                    if (removed[i]) continue
+                    kept.add(candidates[i])
+                    for (bPos in aPos + 1 until m) {
+                        val j = idxs[bPos]
+                        if (!removed[j] && iouQuick(i, j) > iouThresh) {
+                            removed[j] = true
+                        }
+                    }
+                }
+            }
+            if (kept.size > 1) kept.sortByDescending { it.confidence }
+        }
+
         return kept
     }
+
 }
