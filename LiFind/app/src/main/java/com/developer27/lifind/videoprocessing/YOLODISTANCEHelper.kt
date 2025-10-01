@@ -18,7 +18,8 @@ import kotlin.math.max
  *  - Exposes "one box" post-processor (best single box overall)
  *
  * Model: lifind_distance_100_yolo_11s.tflite
- * Classes: "3","6","9","12","15","18","21","24","27","30"
+ * Classes: "11","12","13","14","15","16", "17",
+ *         "18", "19", "20", "21", "22", "23", "24", "25", "26","27"
  */
 object YOLODISTANCEHelper {
 
@@ -71,7 +72,8 @@ object YOLODISTANCEHelper {
 
     // ------------- Labels / utilities -------------
 
-    private val labels = arrayOf("9","12","15","18","21","24","27","30")
+    private val labels = arrayOf("11","12","13","14","15","16", "17",
+        "18", "19", "20", "21", "22", "23", "24", "25", "26","27")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"
