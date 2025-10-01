@@ -85,7 +85,7 @@ object YOLOLEDHelper {
         return if (denom > 0f) inter / denom else 0f
     }
 
-    private val labels = arrayOf("1010", "1000", "1001")
+    private val labels = arrayOf("1010", "1001", "1000")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"
