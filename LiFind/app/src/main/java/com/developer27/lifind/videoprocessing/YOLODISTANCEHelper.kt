@@ -17,7 +17,7 @@ import kotlin.math.max
  *  - Applies NMS (class-agnostic or per-class)
  *  - Exposes "one box" post-processor (best single box overall)
  *
- * Model: lifind_distance_100_yolo_11s.tflite
+ * Model: lifind_distance_detection_new_float32.tflite
  * Classes: "11","12","13","14","15","16", "17",
  *         "18", "19", "20", "21", "22", "23", "24", "25", "26","27"
  */
@@ -26,7 +26,7 @@ object YOLODISTANCEHelper {
     // ------------- Model / I/O -------------
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_iso_distance_100_yolo_11m_google_collab.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_distance_detection_new_float32.tflite"
 
     /** Public for convenience when wiring expected class count. */
     val NUM_CLASSES: Int get() = labels.size
