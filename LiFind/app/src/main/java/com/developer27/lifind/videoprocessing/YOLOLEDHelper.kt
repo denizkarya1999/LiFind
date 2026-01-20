@@ -17,7 +17,7 @@ import java.nio.channels.FileChannel
 object YOLOLEDHelper {
 
     const val INPUT_SIZE = 640
-    private const val MODEL_ASSET_NAME = "lifind_iso_led_100_yolo_11l_google_collab.tflite"
+    private const val MODEL_ASSET_NAME = "lifind_led_detection_new_float32.tflite"
 
     @Volatile
     private var interpreter: Interpreter? = null
