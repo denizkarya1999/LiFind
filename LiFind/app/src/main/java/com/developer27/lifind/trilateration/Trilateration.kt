@@ -5,13 +5,13 @@ import kotlin.math.sqrt
 
 object Trilateration {
     // Legacy fixed LED positions for backward-compatibility
-    private val LED_A = Pair(0.0, 0.0)
-    private val LED_B = Pair(-2.0, -2.0)
-    private val LED_C = Pair(2.0, -2.0)
+    private val LED_A = Pair(0.0, 43.18)
+    private val LED_B = Pair(43.18, 0.0)
+    private val LED_C = Pair(-43.18, 0.0)
 
     // ---- Config (no callsite change needed) ----
     @Volatile var interpretDistancesAsRadial3D: Boolean = false
-    @Volatile var sensorHeight: Double = 0.0
+    @Volatile var sensorHeight: Double = 228.6
 
     /** Optional: call once during setup if your 'distances' are raw 3D radii and camera is H above the LED plane. */
     fun setDistancesAreRadial3D(enabled: Boolean, height: Double) {
@@ -39,7 +39,7 @@ object Trilateration {
         val (Cx, Cy) = C
 
         // Radial (3D) -> planar (XY) using fixed height H = 15
-        val H = 15.0
+        val H = 228.6
         val h2 = H * H
         val (dA, dB, dC) = distances
         val DA = sqrt(max(0.0, dA.pow(2) - H.pow(2)))

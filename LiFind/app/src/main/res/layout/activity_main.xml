@@ -141,6 +141,32 @@
             android:textColor="@color/darkBlue"
             android:textSize="24sp" />
 
+        <!-- Switch Camera -->
+        <Button
+            android:id="@+id/switchCameraButton"
+            android:layout_width="60dp"
+            android:layout_height="60dp"
+            android:layout_marginBottom="16dp"
+            android:backgroundTint="@color/yellow"
+            android:elevation="2dp"
+            android:text="↺"
+            android:textColor="@color/darkBlue"
+            android:textSize="22sp"
+            android:contentDescription="@string/switch_camera" />
+
+        <!-- NEW: Eval ZIP (under Switch Camera) -->
+        <Button
+            android:id="@+id/evaluateZipButton"
+            android:layout_width="60dp"
+            android:layout_height="60dp"
+            android:layout_marginBottom="16dp"
+            android:backgroundTint="@color/white"
+            android:elevation="2dp"
+            android:text="I"
+            android:textColor="@color/black"
+            android:textSize="16sp"
+            android:contentDescription="Evaluate ZIP dataset" />
+
         <Button
             android:id="@+id/clearButton"
             android:layout_width="60dp"
@@ -153,7 +179,7 @@
             android:textSize="24sp" />
     </LinearLayout>
 
-    <!-- Bottom Controls, including Upload and View Map Buttons -->
+    <!-- Bottom Controls -->
     <LinearLayout
         android:id="@+id/button_container"
         android:layout_width="wrap_content"

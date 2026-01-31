@@ -19,9 +19,9 @@ import kotlin.math.max
 import kotlin.math.min
 
 class MapActivity : AppCompatActivity() {
-    private var LED_1: Point = Point(0.0, 0.0)
-    private var LED_2: Point = Point(0.0, 0.0)
-    private var LED_3: Point = Point(0.0, 0.0)
+    private var LED_1: Point = Point(0.0, 43.18)
+    private var LED_2: Point = Point(43.18, 0.0)
+    private var LED_3: Point = Point(-43.18, 0.0)
 
     private var LED_1_Distance: Double = 0.0
     private var LED_2_Distance: Double = 0.0
@@ -37,9 +37,9 @@ class MapActivity : AppCompatActivity() {
 
         // 2) World LED anchors (same as Python layout)
         val ledCoords = listOf(
-            0.0 to 2.0,   // LED_1
-            -2.0 to -2.0, // LED_2
-            2.0 to -2.0   // LED_3
+            0.0 to 43.18,   // LED_1
+            43.18 to 0.0, // LED_2
+            -43.18 to 0.0   // LED_3
         )
         val distances = listOf(
             LED_1_Distance,

@@ -99,7 +99,7 @@ object YOLOLEDHelper {
     // ✅ From your dataset data.yaml:
     // nc: 3
     // names: ['1000','1001','1010']
-    private val labels = arrayOf("1000", "1001", "1010")
+    val labels = arrayOf("1000", "1001", "1010")
 
     fun classNameForId(id: Int): String =
         if (id in labels.indices) labels[id] else "N/A"

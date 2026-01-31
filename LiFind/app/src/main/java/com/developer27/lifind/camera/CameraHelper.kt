@@ -27,7 +27,7 @@ import com.developer27.lifind.databinding.ActivityMainBinding
 /**
  * CameraHelper is responsible for:
  *  - Opening & closing the camera
- *  - Switching front/back
+ *  - Switching front/back (NEW: persisted in SharedPreferences)
  *  - Creating a preview
  *  - Handling zoom & shutter speed
  *  - Starting a background thread for camera operations
@@ -39,6 +39,13 @@ class CameraHelper(
     private val viewBinding: ActivityMainBinding,
     private val sharedPreferences: SharedPreferences
 ) {
+    companion object {
+        // Persist camera facing in prefs: "front" | "back"
+        private const val PREF_CAMERA_FACING = "camera_facing"
+        private const val FACING_FRONT = "front"
+        private const val FACING_BACK = "back"
+    }
+
     // The Android Camera2 API
     val cameraManager: CameraManager by lazy {
         activity.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -58,8 +65,9 @@ class CameraHelper(
     // Sensor area for zoom
     var sensorArraySize: Rect? = null
 
-    // Whether we are using the front camera
-    var isFrontCamera = false
+    // Whether we are using the front camera (loaded from prefs)
+    var isFrontCamera: Boolean = false
+        private set
 
     // Thread for camera operations
     private var backgroundThread: HandlerThread? = null
@@ -69,6 +77,21 @@ class CameraHelper(
     // Zoom control
     private var zoomLevel = 1.0f
     private val maxZoom = 10.0f
+
+    init {
+        loadFacingFromPrefs()
+    }
+
+    private fun loadFacingFromPrefs() {
+        val facing = sharedPreferences.getString(PREF_CAMERA_FACING, FACING_BACK) ?: FACING_BACK
+        isFrontCamera = (facing == FACING_FRONT)
+    }
+
+    private fun saveFacingToPrefs(front: Boolean) {
+        sharedPreferences.edit()
+            .putString(PREF_CAMERA_FACING, if (front) FACING_FRONT else FACING_BACK)
+            .apply()
+    }
 
     /**
      * Callback for camera device events
@@ -111,6 +134,44 @@ class CameraHelper(
         } catch (e: InterruptedException) {
             e.printStackTrace()
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // Front/Back camera option (NEW)
+    // ------------------------------------------------------------------------
+    /**
+     * Call this from UI (toggle/switch) to force front/back.
+     * Persisted to SharedPreferences and restarts camera safely.
+     */
+    @SuppressLint("MissingPermission")
+    @RequiresPermission(Manifest.permission.CAMERA)
+    fun setFrontCameraEnabled(enabled: Boolean) {
+        if (isFrontCamera == enabled) return
+        isFrontCamera = enabled
+        saveFacingToPrefs(enabled)
+        restartCamera()
+    }
+
+    /**
+     * Call this from UI (button) to toggle front/back.
+     */
+    @SuppressLint("MissingPermission")
+    @RequiresPermission(Manifest.permission.CAMERA)
+    fun toggleCameraFacing() {
+        isFrontCamera = !isFrontCamera
+        saveFacingToPrefs(isFrontCamera)
+        restartCamera()
+    }
+
+    @SuppressLint("MissingPermission")
+    @RequiresPermission(Manifest.permission.CAMERA)
+    private fun restartCamera() {
+        // reset zoom (optional safety when switching cameras)
+        zoomLevel = 1.0f
+
+        // Close then reopen with new facing
+        closeCamera()
+        openCamera()
     }
 
     // ------------------------------------------------------------------------
@@ -245,21 +306,30 @@ class CameraHelper(
     }
 
     // ------------------------------------------------------------------------
-    // Camera Selection (Front/Back)
+    // Camera Selection (Front/Back) - UPDATED: robust fallback
     // ------------------------------------------------------------------------
     fun getCameraId(): String {
+        var backId: String? = null
+        var frontId: String? = null
+
         for (id in cameraManager.cameraIdList) {
             val facing = cameraManager
                 .getCameraCharacteristics(id)
                 .get(CameraCharacteristics.LENS_FACING)
-            if (!isFrontCamera && facing == CameraCharacteristics.LENS_FACING_BACK) {
-                return id
-            } else if (isFrontCamera && facing == CameraCharacteristics.LENS_FACING_FRONT) {
-                return id
+
+            if (facing == CameraCharacteristics.LENS_FACING_BACK && backId == null) {
+                backId = id
+            }
+            if (facing == CameraCharacteristics.LENS_FACING_FRONT && frontId == null) {
+                frontId = id
             }
         }
-        // fallback if none matched
-        return cameraManager.cameraIdList.first()
+
+        return if (isFrontCamera) {
+            frontId ?: backId ?: cameraManager.cameraIdList.first()
+        } else {
+            backId ?: frontId ?: cameraManager.cameraIdList.first()
+        }
     }
 
     private fun chooseOptimalSize(choices: Array<Size>): Size {

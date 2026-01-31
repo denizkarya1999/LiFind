@@ -31,10 +31,13 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.lifecycleScope
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.trilateration.MapActivity
+import com.developer27.lifind.videoprocessing.SingleModelEvaluator
 import com.developer27.lifind.videoprocessing.VideoProcessor
+import kotlinx.coroutines.launch
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
@@ -57,6 +60,20 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
     private lateinit var pickMediaLauncher: ActivityResultLauncher<String>
+
+    // ----------------------------
+    // ZIP Evaluation
+    // ----------------------------
+    private enum class EvalModel { LED, DISTANCE }
+    private var evalModel: EvalModel? = null
+
+    private lateinit var pickTrainZip: ActivityResultLauncher<String>
+    private lateinit var pickValZip: ActivityResultLauncher<String>
+    private lateinit var pickTestZip: ActivityResultLauncher<String>
+
+    private var trainZipUri: Uri? = null
+    private var valZipUri: Uri? = null
+    private var testZipUri: Uri? = null
 
     companion object {
         private const val SETTINGS_REQUEST_CODE = 1
@@ -131,6 +148,59 @@ class MainActivity : AppCompatActivity() {
             requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
         }
 
+        // Switch camera button
+        viewBinding.switchCameraButton.setOnClickListener {
+            if (allPermissionsGranted()) {
+                cameraHelper.toggleCameraFacing()
+            } else {
+                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+            }
+        }
+
+        // ------------------------------------------------------------
+        // ZIP evaluation pickers - user selects train/val/test zips
+        // ------------------------------------------------------------
+        pickTrainZip = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            trainZipUri = uri
+            if (uri != null) {
+                Toast.makeText(this, "Selected TRAIN zip", Toast.LENGTH_SHORT).show()
+                pickValZip.launch("application/zip")
+            } else {
+                Toast.makeText(this, "Train zip not selected.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        pickValZip = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            valZipUri = uri
+            if (uri != null) {
+                Toast.makeText(this, "Selected VAL zip", Toast.LENGTH_SHORT).show()
+                pickTestZip.launch("application/zip")
+            } else {
+                Toast.makeText(this, "Val zip not selected.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        pickTestZip = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            testZipUri = uri
+            if (uri == null) {
+                Toast.makeText(this, "Test zip not selected.", Toast.LENGTH_SHORT).show()
+                return@registerForActivityResult
+            }
+            Toast.makeText(this, "Selected TEST zip", Toast.LENGTH_SHORT).show()
+
+            val m = evalModel ?: return@registerForActivityResult
+            val t = trainZipUri ?: return@registerForActivityResult
+            val v = valZipUri ?: return@registerForActivityResult
+            val te = testZipUri ?: return@registerForActivityResult
+
+            runZipEvaluation(m, t, v, te)
+        }
+
+        // Eval ZIP button
+        viewBinding.evaluateZipButton.setOnClickListener {
+            showModelPickerAndStartZipSelection()
+        }
+
         viewBinding.startProcessingButton.setOnClickListener {
             if (isRecording) {
                 stopProcessingAndRecording()
@@ -178,6 +248,80 @@ class MainActivity : AppCompatActivity() {
         pickMediaLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
             uri?.let { handlePickedMedia(it) }
         }
+
+        // Optional: keep or remove
+        viewBinding.settingsButton.setOnLongClickListener {
+            showModelPickerAndStartZipSelection()
+            true
+        }
+    }
+
+    // ----------------------------
+    // ZIP Evaluation helpers
+    // ----------------------------
+    private fun showModelPickerAndStartZipSelection() {
+        val options = arrayOf("LED Detection Model", "Distance Estimation Model")
+        var selected = 0 // default = LED
+
+        AlertDialog.Builder(this)
+            .setTitle("Evaluate which model?")
+            .setSingleChoiceItems(options, selected) { _, which ->
+                selected = which
+            }
+            .setPositiveButton("Next") { _, _ ->
+                evalModel = if (selected == 0) EvalModel.LED else EvalModel.DISTANCE
+
+                trainZipUri = null
+                valZipUri = null
+                testZipUri = null
+
+                pickTrainZip.launch("application/zip")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun runZipEvaluation(model: EvalModel, train: Uri, v: Uri, test: Uri) {
+        val modelType =
+            if (model == EvalModel.LED) SingleModelEvaluator.ModelType.LED
+            else SingleModelEvaluator.ModelType.DISTANCE
+
+        // Disable button during evaluation (no progress UI, no title updates)
+        viewBinding.evaluateZipButton.isEnabled = false
+
+        lifecycleScope.launch {
+            Toast.makeText(this@MainActivity, "Running ${model.name} evaluation…", Toast.LENGTH_SHORT).show()
+
+            val results = SingleModelEvaluator.evaluateTrainValTest(
+                context = this@MainActivity,
+                model = modelType,
+                trainZip = train,
+                valZip = v,
+                testZip = test,
+                includeNoneClass = true,
+                onProgress = { _, _, _ ->
+                    // Intentionally no UI updates (no title, no progress bar)
+                }
+            )
+
+            if (results == null) {
+                Toast.makeText(this@MainActivity, "Evaluation failed.", Toast.LENGTH_LONG).show()
+                viewBinding.evaluateZipButton.isEnabled = true
+                return@launch
+            }
+
+            val files = results.mapNotNull { res ->
+                SingleModelEvaluator.writeCsv(this@MainActivity, modelType, res)
+            }
+
+            Toast.makeText(
+                this@MainActivity,
+                "Saved:\n" + files.joinToString("\n") { it.absolutePath },
+                Toast.LENGTH_LONG
+            ).show()
+
+            viewBinding.evaluateZipButton.isEnabled = true
+        }
     }
 
     // Handle picked image/video
@@ -195,13 +339,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } else if (mimeType?.startsWith("video") == true) {
-            Toast.makeText(this,
-                "Video processing not implemented.",
-                Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Video processing not implemented.", Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(this,
-                "Unsupported file type!",
-                Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Unsupported file type!", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -251,15 +391,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun restartCamera() {
         try {
-            // Stop and fully reset the camera pipeline
             cameraHelper.closeCamera()
             cameraHelper.stopBackgroundThread()
         } catch (_: Throwable) { /* ignore */ }
 
-        // Start threads again
         cameraHelper.startBackgroundThread()
 
-        // Re-open camera or set listener if the TextureView isn't ready yet
         if (allPermissionsGranted()) {
             if (viewBinding.viewFinder.isAvailable) {
                 cameraHelper.openCamera()
@@ -276,16 +413,13 @@ class MainActivity : AppCompatActivity() {
         val vp = videoProcessor ?: return
         val btn = viewBinding.TakeSnapshotButton
 
-        // Always start with a clean processed view
         viewBinding.processedFrameView.setImageDrawable(null)
         viewBinding.processedFrameView.visibility = View.GONE
         viewBinding.processedFrameView.invalidate()
 
-        // UI debounce
         btn.isEnabled = false
         Toast.makeText(this, "Capturing snapshot…", Toast.LENGTH_SHORT).show()
 
-        // get a single frame from the preview
         val snapshot = viewBinding.viewFinder.bitmap
         if (snapshot == null) {
             btn.isEnabled = true
@@ -293,15 +427,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // run your current single-frame pipeline
         vp.processFrame(snapshot) { processed ->
             processed?.let { (annotated, _) ->
-                // briefly show it
                 viewBinding.processedFrameView.setImageBitmap(annotated)
                 viewBinding.processedFrameView.visibility = View.VISIBLE
             }
 
-            // use your EXISTING log-writer (unchanged)
             vp.writeLedDistLogToFile()
 
             cameraHelper.closeCamera()
@@ -310,7 +441,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showHardCodedDistancesDialog() {
-        // Container with simple vertical form
         val container = ScrollView(this).apply {
             val pad = (16 * resources.displayMetrics.density).toInt()
             setPadding(pad, pad, pad, pad)
@@ -331,17 +461,17 @@ class MainActivity : AppCompatActivity() {
         val led1Et = EditText(this).apply {
             hint = "LED A Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("") // optionally prefill e.g., "9"
+            setText("")
         }
         val led2Et = EditText(this).apply {
             hint = "LED B Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("") // optionally prefill e.g., "12"
+            setText("")
         }
         val led3Et = EditText(this).apply {
             hint = "LED C Distance (cm)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText("") // optionally prefill e.g., "15"
+            setText("")
         }
 
         form.addView(led1Et)
@@ -364,7 +494,6 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 writeLedDistLogToFileFromInputs(d1, d2, d3)
-
                 openMapActivity()
             }
             .show()
