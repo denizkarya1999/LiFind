@@ -18,7 +18,6 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.tensorflow.lite.Interpreter
 import java.io.BufferedInputStream
 import java.io.BufferedWriter
 import java.io.File
@@ -46,32 +45,36 @@ object InferenceConfig {
     @Volatile var iouThreshold: Float = 0.25f
 
     @Volatile var classAgnosticNms: Boolean = false
-    @Volatile var multiLabelPerBox: Boolean = false
+    @Volatile var multiLabelPerBox: Boolean = true
+
+    /**
+     * IoU threshold used to MATCH a predicted box to a GT box for confusion-matrix counting.
+     * (This is separate from NMS IoU.)
+     */
+    @Volatile var matchIouThreshold: Float = 0.50f
 }
 
 object SingleModelEvaluator {
 
     private const val TAG = "SingleModelEvaluator"
 
-    enum class ModelType { LED, Distance }
+    enum class ModelType { LED, DISTANCE }
 
     data class SplitResult(
         val splitName: String,               // train | val | test
         val classCount: Int,                 // K
         val includeNone: Boolean,
-        val matrix: Array<IntArray>,         // [gt][pred]
-        val totalUsed: Int,
-        val skippedNoLabel: Int,
-        val noDetection: Int,
-        val skippedDecodeFail: Int
+        val matrix: Array<IntArray>,         // [gt][pred] with optional NONE row/col
+        val totalGtBoxes: Int,               // total GT objects processed
+        val skippedNoLabel: Int,             // images skipped due to missing label file
+        val skippedDecodeFail: Int,           // images skipped due to decode failure
+        val matched: Int,                    // # matched GT boxes
+        val missed: Int,                     // # GT boxes with no matching prediction
+        val falsePositives: Int              // # predictions not matched to any GT
     )
 
     // -------------------- Progress Dialog --------------------
 
-    /**
-     * Simple non-cancelable progress dialog that can be updated from any thread.
-     * Uses AlertDialog + horizontal ProgressBar + message TextView.
-     */
     private class ProgressDialogController(private val context: Context) {
         private val mainHandler = Handler(Looper.getMainLooper())
         private var dialog: Dialog? = null
@@ -104,20 +107,14 @@ object SingleModelEvaluator {
                     setPadding(0, 0, 0, 18)
                 }
 
-                progressBar = ProgressBar(
-                    context,
-                    null,
-                    android.R.attr.progressBarStyleHorizontal
-                ).apply {
+                progressBar = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
                     isIndeterminate = false
                     max = 100
                     progress = 0
                     layoutParams = LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
-                    ).apply {
-                        gravity = Gravity.CENTER_HORIZONTAL
-                    }
+                    ).apply { gravity = Gravity.CENTER_HORIZONTAL }
                 }
 
                 root.addView(titleView)
@@ -143,38 +140,24 @@ object SingleModelEvaluator {
                 if (!isShown.get()) return@post
                 title?.let { titleView?.text = it }
                 msg?.let { msgView?.text = it }
-                progressPercent?.let { p ->
-                    val clamped = p.coerceIn(0, 100)
-                    progressBar?.progress = clamped
-                }
+                progressPercent?.let { progressBar?.progress = it.coerceIn(0, 100) }
             }
         }
 
         fun dismiss() {
             mainHandler.post {
-                try {
-                    dialog?.dismiss()
-                } catch (_: Throwable) {
-                    // ignore
-                } finally {
-                    dialog = null
-                    progressBar = null
-                    titleView = null
-                    msgView = null
-                    isShown.set(false)
-                }
+                try { dialog?.dismiss() } catch (_: Throwable) { }
+                dialog = null
+                progressBar = null
+                titleView = null
+                msgView = null
+                isShown.set(false)
             }
         }
     }
 
-    /**
-     * Optional: Show a progress bar message box while processing.
-     *
-     * - If showProgressDialog=true, a non-cancelable dialog is shown.
-     * - Progress is updated using:
-     *     split progress (0..100) within each split
-     *     and overall progress across train/val/test (0..100)
-     */
+    // -------------------- Public API --------------------
+
     suspend fun evaluateTrainValTest(
         context: Context,
         model: ModelType,
@@ -189,76 +172,33 @@ object SingleModelEvaluator {
         val progressDialog = if (showProgressDialog) ProgressDialogController(context) else null
 
         try {
-            // Show dialog early (main thread)
             progressDialog?.show(
                 initialTitle = "Evaluating ${model.name} Detection Model",
                 initialMsg = "Preparing..."
             )
 
-            // Keep helper NMS IoU consistent with InferenceConfig
             syncSettingsFromInferenceConfig()
 
-            val (interp, k) = when (model) {
-                ModelType.LED -> YOLOLEDHelper.ensureInterpreter(context) to 3
-                ModelType.Distance -> YOLODISTANCEHelper.ensureInterpreter(context) to YOLODISTANCEHelper.NUM_CLASSES
+            val k = when (model) {
+                ModelType.LED -> YOLOLEDHelper.labels.size
+                ModelType.DISTANCE -> YOLODISTANCEHelper.NUM_CLASSES
             }
 
-            // Helper to update overall progress (3 splits total)
             fun updateOverall(splitIndex: Int, splitName: String, done: Int, total: Int) {
-                // splitIndex: 0=train, 1=val, 2=test
                 val splitFrac = if (total > 0) done.toFloat() / total.toFloat() else 0f
                 val overall = ((splitIndex + splitFrac) / 3f * 100f).toInt().coerceIn(0, 100)
-                val splitPct = (splitFrac * 100f).toInt().coerceIn(0, 100)
-
                 progressDialog?.update(
                     title = "Evaluating ${model.name} model",
                     msg = "Split: $splitName ($done / $total)",
                     progressPercent = overall
                 )
-
-                // keep your external callback intact
                 onProgress(splitName, done, total)
-
-                // (Optional) log split percentage sometimes
-                if (done == 1 || done == total || done % 25 == 0) {
-                    Log.d(TAG, "Progress $splitName: $splitPct% (overall $overall%)")
-                }
             }
 
             val results = buildList {
-                add(
-                    evalOneSplit(
-                        context = context,
-                        model = model,
-                        interpreter = interp,
-                        classCount = k,
-                        splitName = "train",
-                        zipUri = trainZip,
-                        includeNone = includeNoneClass
-                    ) { split, done, total -> updateOverall(0, split, done, total) }
-                )
-                add(
-                    evalOneSplit(
-                        context = context,
-                        model = model,
-                        interpreter = interp,
-                        classCount = k,
-                        splitName = "val",
-                        zipUri = valZip,
-                        includeNone = includeNoneClass
-                    ) { split, done, total -> updateOverall(1, split, done, total) }
-                )
-                add(
-                    evalOneSplit(
-                        context = context,
-                        model = model,
-                        interpreter = interp,
-                        classCount = k,
-                        splitName = "test",
-                        zipUri = testZip,
-                        includeNone = includeNoneClass
-                    ) { split, done, total -> updateOverall(2, split, done, total) }
-                )
+                add(evalOneSplit(context, model, k, "Train", trainZip, includeNoneClass) { s, d, t -> updateOverall(0, s, d, t) })
+                add(evalOneSplit(context, model, k, "Val",   valZip,   includeNoneClass) { s, d, t -> updateOverall(1, s, d, t) })
+                add(evalOneSplit(context, model, k, "Test",  testZip,  includeNoneClass) { s, d, t -> updateOverall(2, s, d, t) })
             }
 
             progressDialog?.update(msg = "Done.", progressPercent = 100)
@@ -292,7 +232,7 @@ object SingleModelEvaluator {
             if (res.includeNone && idx == res.classCount) return "NONE"
             return when (model) {
                 ModelType.LED -> YOLOLEDHelper.classNameForId(idx)
-                ModelType.Distance -> YOLODISTANCEHelper.classNameForId(idx)
+                ModelType.DISTANCE -> YOLODISTANCEHelper.classNameForId(idx)
             }
         }
 
@@ -313,13 +253,16 @@ object SingleModelEvaluator {
 
                 out.println()
                 out.println("confidence_threshold,${InferenceConfig.confidenceThreshold}")
-                out.println("iou_threshold,${InferenceConfig.iouThreshold}")
+                out.println("nms_iou_threshold,${InferenceConfig.iouThreshold}")
+                out.println("match_iou_threshold,${InferenceConfig.matchIouThreshold}")
                 out.println("class_agnostic_nms,${InferenceConfig.classAgnosticNms}")
                 out.println("multi_label_per_box,${InferenceConfig.multiLabelPerBox}")
-                out.println("total_used,${res.totalUsed}")
+                out.println("total_gt_boxes,${res.totalGtBoxes}")
+                out.println("matched,${res.matched}")
+                out.println("missed,${res.missed}")
+                out.println("false_positives,${res.falsePositives}")
                 out.println("skipped_no_label,${res.skippedNoLabel}")
                 out.println("skipped_decode_fail,${res.skippedDecodeFail}")
-                out.println("no_detection,${res.noDetection}")
             }
             outFile
         } catch (t: Throwable) {
@@ -328,44 +271,19 @@ object SingleModelEvaluator {
         }
     }
 
-    // -------------------- paths --------------------
+    // -------------------- internal eval --------------------
 
-    private fun getLiFindZipResultsDirOrFallback(context: Context): File {
-        val docsDir = try {
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-        } catch (_: Throwable) {
-            null
-        }
-
-        // EXACT requested path: Documents/LiFind/Zip Inference Results
-        if (docsDir != null) {
-            val target = File(docsDir, "LiFind_Zip_Inference_Results")
-            if (isDirWritable(target)) return target
-        }
-
-        // Fallback: always writable
-        val base = context.getExternalFilesDir(null) ?: context.filesDir
-        return File(base, "LiFind_Zip_Inference_Results")
-    }
-
-    private fun isDirWritable(dir: File): Boolean {
-        return try {
-            if (!dir.exists()) dir.mkdirs()
-            val probe = File(dir, ".probe_${System.currentTimeMillis()}.tmp")
-            probe.writeText("ok")
-            probe.delete()
-            true
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    // -------------------- internal --------------------
+    private data class Box(
+        val classId: Int,
+        val xc: Float,
+        val yc: Float,
+        val w: Float,
+        val h: Float
+    )
 
     private suspend fun evalOneSplit(
         context: Context,
         model: ModelType,
-        interpreter: Interpreter,
         classCount: Int,
         splitName: String,
         zipUri: Uri,
@@ -373,7 +291,6 @@ object SingleModelEvaluator {
         onProgress: (split: String, done: Int, total: Int) -> Unit
     ): SplitResult = withContext(Dispatchers.IO) {
 
-        // Keep helper thresholds in sync
         syncSettingsFromInferenceConfig()
 
         val workDir = File(context.cacheDir, "lifind_eval_${model.name.lowercase()}_$splitName").apply {
@@ -395,51 +312,102 @@ object SingleModelEvaluator {
 
         val size = if (includeNone) classCount + 1 else classCount
         val matrix = Array(size) { IntArray(size) }
+        val noneIdx = if (includeNone) classCount else -1
 
-        var used = 0
-        var skippedNoLabel = 0
-        var skippedDecodeFail = 0
-        var noDet = 0
+        var skippedNoLabelImgs = 0
+        var skippedDecodeFailImgs = 0
+
+        var totalGtBoxes = 0
+        var matched = 0
+        var missed = 0
+        var falsePos = 0
 
         for ((idx, imgFile) in images.withIndex()) {
-
             val bmp = decodeBitmap(imgFile)
             if (bmp == null) {
-                skippedDecodeFail++
+                skippedDecodeFailImgs++
                 Log.w(TAG, "Decode failed: ${imgFile.absolutePath}")
                 onProgress(splitName, idx + 1, images.size)
                 continue
             }
 
-            // Robust GT label lookup (supports many YOLO zip layouts)
-            val gt = readGtClassForImage(unzipDir, imgFile)
-            if (gt == null) {
-                skippedNoLabel++
+            // Read ALL gt boxes (multiple lines) for this image
+            val gtBoxes = readGtBoxesForImage(unzipDir, imgFile)
+            if (gtBoxes == null) {
+                skippedNoLabelImgs++
                 Log.w(TAG, "No label for image: ${imgFile.absolutePath}")
                 onProgress(splitName, idx + 1, images.size)
                 continue
             }
-            val gtIdx = gt.coerceIn(0, classCount - 1)
 
-            val pred = when (model) {
-                ModelType.LED -> inferLed(interpreter, bmp)
-                ModelType.Distance -> inferDistance(interpreter, bmp)
+            totalGtBoxes += gtBoxes.size
+
+            // Run inference -> multiple predicted boxes
+            val predDetections = when (model) {
+                ModelType.LED -> inferLedDetections(context, bmp)
+                ModelType.DISTANCE -> inferDistanceDetections(context, bmp)
             }
 
-            val predIdx = if (pred == null) {
-                noDet++
-                if (includeNone) {
-                    classCount // NONE index
-                } else {
-                    onProgress(splitName, idx + 1, images.size)
-                    continue
+            // Convert predictions to Box (normalized xywh)
+            val predBoxes = predDetections.map { d ->
+                Box(
+                    classId = d.classId,
+                    xc = d.xCenter,
+                    yc = d.yCenter,
+                    w = d.width,
+                    h = d.height
+                )
+            }.toMutableList()
+
+            // Match GT boxes to predictions (one-to-one) using IoU threshold
+            // - Prefer matching SAME CLASS first (standard for detection confusion)
+            // - Each prediction can match at most one GT
+            val predUsed = BooleanArray(predBoxes.size)
+
+            for (gt in gtBoxes) {
+                val gtCls = gt.classId.coerceIn(0, classCount - 1)
+
+                var bestJ = -1
+                var bestIou = 0f
+
+                for (j in predBoxes.indices) {
+                    if (predUsed[j]) continue
+                    val pr = predBoxes[j]
+
+                    // By default we match by class (recommended).
+                    // If you want class-agnostic matching, remove this check.
+                    if (pr.classId != gtCls) continue
+
+                    val iou = iouXYWH(gt, pr)
+                    if (iou >= InferenceConfig.matchIouThreshold && iou > bestIou) {
+                        bestIou = iou
+                        bestJ = j
+                    }
                 }
-            } else {
-                pred.coerceIn(0, classCount - 1)
+
+                if (bestJ >= 0) {
+                    predUsed[bestJ] = true
+                    val prCls = predBoxes[bestJ].classId.coerceIn(0, classCount - 1)
+                    matrix[gtCls][prCls]++
+                    matched++
+                } else {
+                    // No matching prediction for this GT
+                    missed++
+                    if (includeNone) {
+                        matrix[gtCls][noneIdx]++
+                    }
+                }
             }
 
-            matrix[gtIdx][predIdx]++
-            used++
+            // Any remaining predictions are false positives (GT = NONE)
+            if (includeNone) {
+                for (j in predBoxes.indices) {
+                    if (predUsed[j]) continue
+                    val prCls = predBoxes[j].classId.coerceIn(0, classCount - 1)
+                    matrix[noneIdx][prCls]++
+                    falsePos++
+                }
+            }
 
             onProgress(splitName, idx + 1, images.size)
         }
@@ -449,16 +417,22 @@ object SingleModelEvaluator {
             classCount = classCount,
             includeNone = includeNone,
             matrix = matrix,
-            totalUsed = used,
-            skippedNoLabel = skippedNoLabel,
-            noDetection = noDet,
-            skippedDecodeFail = skippedDecodeFail
+            totalGtBoxes = totalGtBoxes,
+            skippedNoLabel = skippedNoLabelImgs,
+            skippedDecodeFail = skippedDecodeFailImgs,
+            matched = matched,
+            missed = missed,
+            falsePositives = falsePos
         )
     }
 
-    private fun inferLed(interpreter: Interpreter, src: Bitmap): Int? {
+    // -------------------- inference (use helpers) --------------------
+
+    private fun inferLedDetections(context: Context, src: Bitmap): List<DetectionResult> {
+        val interpreter = YOLOLEDHelper.ensureInterpreter(context)
+
         val inputBmp = YOLOLEDHelper.autoOrientAndResize(src)
-        val input = BitmapToFloatTensor.nhwc(inputBmp)
+        val input = BitmapToFloatTensor.nhwc(inputBmp, YOLOLEDHelper.INPUT_SIZE)
 
         val outTensor = interpreter.getOutputTensor(0)
         val s = outTensor.shape()
@@ -466,19 +440,20 @@ object SingleModelEvaluator {
 
         interpreter.run(input, out)
 
-        val dets = YOLOLEDHelper.parseTFLite(
+        return YOLOLEDHelper.parseTFLite(
             raw = out,
             confidenceThreshold = InferenceConfig.confidenceThreshold,
             classAgnosticNms = InferenceConfig.classAgnosticNms,
             multiLabelPerBox = InferenceConfig.multiLabelPerBox,
-            expectedClasses = 3
+            expectedClasses = YOLOLEDHelper.labels.size
         )
-        return dets.maxByOrNull { it.confidence }?.classId
     }
 
-    private fun inferDistance(interpreter: Interpreter, src: Bitmap): Int? {
+    private fun inferDistanceDetections(context: Context, src: Bitmap): List<DetectionResult> {
+        val interpreter = YOLODISTANCEHelper.ensureInterpreter(context)
+
         val inputBmp = YOLODISTANCEHelper.autoOrientAndResize(src)
-        val input = BitmapToFloatTensor.nhwc(inputBmp)
+        val input = BitmapToFloatTensor.nhwc(inputBmp, YOLODISTANCEHelper.INPUT_SIZE)
 
         val outTensor = interpreter.getOutputTensor(0)
         val s = outTensor.shape()
@@ -486,85 +461,133 @@ object SingleModelEvaluator {
 
         interpreter.run(input, out)
 
-        val dets = YOLODISTANCEHelper.parseTFLite(
+        return YOLODISTANCEHelper.parseTFLite(
             raw = out,
             confidenceThreshold = InferenceConfig.confidenceThreshold,
             classAgnosticNms = InferenceConfig.classAgnosticNms,
             multiLabelPerBox = InferenceConfig.multiLabelPerBox,
             expectedClasses = YOLODISTANCEHelper.NUM_CLASSES
         )
-        return YOLODISTANCEHelper.bestOne(dets)?.classId
+    }
+
+    // -------------------- GT parsing (multiple lines) --------------------
+
+    /**
+     * Reads YOLO label file for an image (multiple lines => multiple objects).
+     * Returns null if label file not found.
+     * Returns empty list if file exists but has no valid lines.
+     *
+     * Each line: class xc yc w h (normalized 0..1)
+     */
+    private fun readGtBoxesForImage(root: File, imageFile: File): List<Box>? {
+        val labelFile = findLabelFileForImage(root, imageFile) ?: return null
+
+        val out = ArrayList<Box>(8)
+        labelFile.bufferedReader().useLines { seq ->
+            seq.forEach { line ->
+                val t = line.trim()
+                if (t.isEmpty()) return@forEach
+                val parts = t.split(Regex("\\s+"))
+                if (parts.size < 5) return@forEach
+
+                val cls = parts[0].toIntOrNull() ?: return@forEach
+                val xc = parts[1].toFloatOrNull() ?: return@forEach
+                val yc = parts[2].toFloatOrNull() ?: return@forEach
+                val w  = parts[3].toFloatOrNull() ?: return@forEach
+                val h  = parts[4].toFloatOrNull() ?: return@forEach
+
+                out.add(
+                    Box(
+                        classId = cls,
+                        xc = xc.coerceIn(0f, 1f),
+                        yc = yc.coerceIn(0f, 1f),
+                        w = w.coerceIn(0f, 1f),
+                        h = h.coerceIn(0f, 1f)
+                    )
+                )
+            }
+        }
+        return out
     }
 
     /**
-     * Robust GT label lookup for common YOLO zip layouts.
-     *
-     * Supports:
-     * - .../images/xxx.jpg   with sibling .../labels/xxx.txt (case-insensitive folder names)
-     * - train/val/test splits (labels folder near the images folder)
-     * - alternative naming: Labels, annotations, Annotations
-     * - a global root "labels/**/xxx.txt" as a fallback
+     * Finds matching label file for an image.
+     * Supports common YOLO layouts:
+     *  - .../images/xxx.jpg and .../labels/xxx.txt
+     *  - .../train/images/xxx.jpg and .../train/labels/xxx.txt
+     *  - root/labels/**/xxx.txt (fallback)
      */
-    private fun readGtClassForImage(root: File, imageFile: File): Int? {
+    private fun findLabelFileForImage(root: File, imageFile: File): File? {
         val baseName = imageFile.nameWithoutExtension
+        val imgPathUnix = imageFile.absolutePath.replace("\\", "/")
 
-        val labelDirs = LinkedHashSet<File>()
-        val labelFolderNames = listOf("labels", "annotations")
+        // Case 1: replace /images/ with /labels/ (case-insensitive folder names not guaranteed by string replace,
+        // but this catches most lower-case datasets)
+        val candidate1 = if (imgPathUnix.contains("/images/")) {
+            val guess = imgPathUnix
+                .replace("/images/", "/labels/")
+                .replaceAfterLast("/", "$baseName.txt")
+            File(guess)
+        } else null
 
+        // Case 2: sibling labels folder next to an Images/images folder (case-insensitive scan upwards)
+        var candidate2: File? = null
         var p: File? = imageFile.parentFile
         repeat(7) {
             val cur = p ?: return@repeat
-
-            for (name in labelFolderNames) {
-                val d = File(cur, name)
-                if (d.exists() && d.isDirectory) labelDirs.add(d)
-
-                val d2 = File(cur, name.replaceFirstChar { it.uppercaseChar() })
-                if (d2.exists() && d2.isDirectory) labelDirs.add(d2)
-            }
-
             if (cur.name.equals("images", ignoreCase = true)) {
                 val parent = cur.parentFile
                 if (parent != null) {
-                    for (name in labelFolderNames) {
-                        val d = File(parent, name)
-                        if (d.exists() && d.isDirectory) labelDirs.add(d)
-
-                        val d2 = File(parent, name.replaceFirstChar { it.uppercaseChar() })
-                        if (d2.exists() && d2.isDirectory) labelDirs.add(d2)
-                    }
+                    val d1 = File(parent, "labels")
+                    val d2 = File(parent, "Labels")
+                    val f1 = File(d1, "$baseName.txt")
+                    val f2 = File(d2, "$baseName.txt")
+                    if (f1.exists()) candidate2 = f1
+                    if (candidate2 == null && f2.exists()) candidate2 = f2
                 }
             }
-
             p = cur.parentFile
         }
 
-        try {
-            root.walkTopDown()
-                .maxDepth(8)
-                .filter { it.isDirectory && (it.name.equals("labels", true) || it.name.equals("annotations", true)) }
-                .forEach { labelDirs.add(it) }
-        } catch (_: Throwable) {
-            // ignore
-        }
+        // Case 3: root/labels/**/xxx.txt fallback
+        val labelsDir = File(root, "labels")
+        val candidate3 = if (labelsDir.exists()) {
+            labelsDir.walkTopDown().firstOrNull { it.isFile && it.name == "$baseName.txt" }
+        } else null
 
-        val labelFile = labelDirs
-            .asSequence()
-            .map { dir -> File(dir, "$baseName.txt") }
-            .firstOrNull { it.exists() }
-            ?: run {
-                val same = File(imageFile.parentFile, "$baseName.txt")
-                if (same.exists()) same else null
-            }
-            ?: return null
-
-        val firstLine = labelFile.bufferedReader().useLines { seq ->
-            seq.firstOrNull { it.isNotBlank() }
-        } ?: return null
-
-        val clsStr = firstLine.trim().split(Regex("\\s+")).firstOrNull() ?: return null
-        return clsStr.toIntOrNull()
+        return listOfNotNull(candidate1, candidate2, candidate3).firstOrNull { it.exists() }
     }
+
+    // -------------------- IoU (xywh normalized) --------------------
+
+    private fun iouXYWH(a: Box, b: Box): Float {
+        val ax1 = a.xc - 0.5f * a.w
+        val ay1 = a.yc - 0.5f * a.h
+        val ax2 = a.xc + 0.5f * a.w
+        val ay2 = a.yc + 0.5f * a.h
+
+        val bx1 = b.xc - 0.5f * b.w
+        val by1 = b.yc - 0.5f * b.h
+        val bx2 = b.xc + 0.5f * b.w
+        val by2 = b.yc + 0.5f * b.h
+
+        val x1 = maxOf(ax1, bx1)
+        val y1 = maxOf(ay1, by1)
+        val x2 = minOf(ax2, bx2)
+        val y2 = minOf(ay2, by2)
+
+        val iw = (x2 - x1).coerceAtLeast(0f)
+        val ih = (y2 - y1).coerceAtLeast(0f)
+        val inter = iw * ih
+
+        val areaA = (ax2 - ax1).coerceAtLeast(0f) * (ay2 - ay1).coerceAtLeast(0f)
+        val areaB = (bx2 - bx1).coerceAtLeast(0f) * (by2 - by1).coerceAtLeast(0f)
+        val denom = areaA + areaB - inter
+
+        return if (denom > 0f) inter / denom else 0f
+    }
+
+    // -------------------- IO helpers --------------------
 
     private fun decodeBitmap(file: File): Bitmap? =
         try { BitmapFactory.decodeFile(file.absolutePath) } catch (_: Throwable) { null }
@@ -583,6 +606,7 @@ object SingleModelEvaluator {
                 val safeName = entry.name.replace("\\", "/")
                 val outFile = File(destDir, safeName)
 
+                // ZipSlip protection
                 val canonicalDest = destDir.canonicalPath
                 val canonicalOut = outFile.canonicalPath
                 require(canonicalOut.startsWith(canonicalDest)) { "Blocked ZipSlip: ${entry!!.name}" }
@@ -600,10 +624,38 @@ object SingleModelEvaluator {
         }
     }
 
-    /**
-     * Best-effort: keep helper NMS IoU consistent with InferenceConfig by syncing into Settings.Inference.*
-     * without taking a compile-time dependency on Settings having mutable vars.
-     */
+    // -------------------- output dir --------------------
+
+    private fun getLiFindZipResultsDirOrFallback(context: Context): File {
+        val docsDir = try {
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        } catch (_: Throwable) {
+            null
+        }
+
+        if (docsDir != null) {
+            val target = File(docsDir, "LiFind_Zip_Inference_Results")
+            if (isDirWritable(target)) return target
+        }
+
+        val base = context.getExternalFilesDir(null) ?: context.filesDir
+        return File(base, "LiFind_Zip_Inference_Results")
+    }
+
+    private fun isDirWritable(dir: File): Boolean {
+        return try {
+            if (!dir.exists()) dir.mkdirs()
+            val probe = File(dir, ".probe_${System.currentTimeMillis()}.tmp")
+            probe.writeText("ok")
+            probe.delete()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    // -------------------- settings sync --------------------
+
     private fun syncSettingsFromInferenceConfig() {
         try {
             val inferenceCls = Class.forName("com.developer27.lifind.videoprocessing.Settings\$Inference")

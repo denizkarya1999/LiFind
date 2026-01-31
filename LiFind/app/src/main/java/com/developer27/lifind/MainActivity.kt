@@ -284,7 +284,7 @@ class MainActivity : AppCompatActivity() {
     private fun runZipEvaluation(model: EvalModel, train: Uri, v: Uri, test: Uri) {
         val modelType =
             if (model == EvalModel.LED) SingleModelEvaluator.ModelType.LED
-            else SingleModelEvaluator.ModelType.Distance
+            else SingleModelEvaluator.ModelType.DISTANCE
 
         // Disable button during evaluation (no progress UI, no title updates)
         viewBinding.evaluateZipButton.isEnabled = false
