@@ -53,7 +53,7 @@ object SingleModelEvaluator {
 
     private const val TAG = "SingleModelEvaluator"
 
-    enum class ModelType { LED, DISTANCE }
+    enum class ModelType { LED, Distance }
 
     data class SplitResult(
         val splitName: String,               // train | val | test
@@ -191,7 +191,7 @@ object SingleModelEvaluator {
         try {
             // Show dialog early (main thread)
             progressDialog?.show(
-                initialTitle = "Evaluating ${model.name} Model",
+                initialTitle = "Evaluating ${model.name} Detection Model",
                 initialMsg = "Preparing..."
             )
 
@@ -200,7 +200,7 @@ object SingleModelEvaluator {
 
             val (interp, k) = when (model) {
                 ModelType.LED -> YOLOLEDHelper.ensureInterpreter(context) to 3
-                ModelType.DISTANCE -> YOLODISTANCEHelper.ensureInterpreter(context) to YOLODISTANCEHelper.NUM_CLASSES
+                ModelType.Distance -> YOLODISTANCEHelper.ensureInterpreter(context) to YOLODISTANCEHelper.NUM_CLASSES
             }
 
             // Helper to update overall progress (3 splits total)
@@ -292,7 +292,7 @@ object SingleModelEvaluator {
             if (res.includeNone && idx == res.classCount) return "NONE"
             return when (model) {
                 ModelType.LED -> YOLOLEDHelper.classNameForId(idx)
-                ModelType.DISTANCE -> YOLODISTANCEHelper.classNameForId(idx)
+                ModelType.Distance -> YOLODISTANCEHelper.classNameForId(idx)
             }
         }
 
@@ -423,7 +423,7 @@ object SingleModelEvaluator {
 
             val pred = when (model) {
                 ModelType.LED -> inferLed(interpreter, bmp)
-                ModelType.DISTANCE -> inferDistance(interpreter, bmp)
+                ModelType.Distance -> inferDistance(interpreter, bmp)
             }
 
             val predIdx = if (pred == null) {
