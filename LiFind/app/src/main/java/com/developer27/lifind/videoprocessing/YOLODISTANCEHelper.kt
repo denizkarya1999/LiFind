@@ -65,9 +65,10 @@ object YOLODISTANCEHelper {
     }
 
     private fun loadModelFromAssets(context: Context, assetName: String): MappedByteBuffer {
-        val afd = context.assets.openFd(assetName)
-        FileInputStream(afd.fileDescriptor).channel.use { ch ->
-            return ch.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+        context.assets.openFd(assetName).use { afd ->
+            FileInputStream(afd.fileDescriptor).channel.use { ch ->
+                return ch.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+            }
         }
     }
 
@@ -163,7 +164,8 @@ object YOLODISTANCEHelper {
     private fun applyNms(
         candidates: MutableList<DetectionResult>,
         expectedClasses: Int,
-        classAgnosticNms: Boolean
+        classAgnosticNms: Boolean,
+        iouThreshold: Float = Settings.Inference.iouThreshold
     ): List<DetectionResult> {
         if (candidates.isEmpty()) return emptyList()
 
@@ -184,7 +186,7 @@ object YOLODISTANCEHelper {
 
                 if (!classAgnosticNms && a.classId != b.classId) continue
 
-                if (iou(a, b) > Settings.Inference.iouThreshold) {
+                if (iou(a, b) > iouThreshold) {
                     removed[j] = true
                 }
             }
@@ -208,19 +210,19 @@ object YOLODISTANCEHelper {
         confidenceThreshold: Float,
         classAgnosticNms: Boolean,
         multiLabelPerBox: Boolean,
-        expectedClasses: Int
+        expectedClasses: Int,
+        iouThreshold: Float = Settings.Inference.iouThreshold
     ): List<DetectionResult> {
 
         if (raw.isEmpty() || raw[0].isEmpty() || raw[0][0].isEmpty()) return emptyList()
-
         val b = raw[0]
         val d1 = b.size
         val d2 = b[0].size
 
-        // Decide CHW ([C][N]) vs HWC ([N][C]) by plausible channel sizes
-        val plausibleMaxChannels = 512
-        val d1LooksLikeChannels = d1 in 6..plausibleMaxChannels && d2 >= d1
-        val d2LooksLikeChannels = d2 in 6..plausibleMaxChannels && d1 >= d2
+        // Channel count comes from the model, even when there are fewer boxes than classes.
+        val channelCounts = setOf(6, 4 + expectedClasses, 5 + expectedClasses)
+        val d1LooksLikeChannels = d1 in channelCounts
+        val d2LooksLikeChannels = d2 in channelCounts
 
         val channels: Int
         val numPoints: Int
@@ -311,7 +313,7 @@ object YOLODISTANCEHelper {
             }
 
             // Apply NMS (safe; even if already NMS-fused, it won't break)
-            return applyNms(candidates, expectedClasses, classAgnosticNms)
+            return applyNms(candidates, expectedClasses, classAgnosticNms, iouThreshold)
         }
 
         // ------------------------------------------------------------
@@ -400,7 +402,7 @@ object YOLODISTANCEHelper {
             }
         }
 
-        return applyNms(candidates, expectedClasses, classAgnosticNms)
+        return applyNms(candidates, expectedClasses, classAgnosticNms, iouThreshold)
     }
 
     /**

@@ -18,4 +18,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "LiFind"
 include(":app")
-include(":OpenCV-4.10.0")

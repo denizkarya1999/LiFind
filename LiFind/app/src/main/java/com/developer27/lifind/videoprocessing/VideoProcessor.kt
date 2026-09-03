@@ -2,8 +2,12 @@ package com.developer27.lifind.videoprocessing
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Environment
 import android.util.Log
+import com.developer27.lifind.trilateration.LedMeasurementStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -12,12 +16,7 @@ import kotlinx.coroutines.withContext
 import org.opencv.android.Utils
 import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
-import org.tensorflow.lite.DataType
-import org.tensorflow.lite.support.image.TensorImage
-import java.io.BufferedWriter
 import java.io.File
-import java.io.FileWriter
-import java.io.PrintWriter
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
@@ -40,9 +39,6 @@ private data class LedDistanceSample(
     val dist2Cm: Double?,   // matched to LED_2
     val dist3Cm: Double?    // matched to LED_3
 )
-
-private val ledDistSamples = java.util.Collections.synchronizedList(mutableListOf<LedDistanceSample>())
-private fun resetLedDistLogBuffer() = ledDistSamples.clear()
 
 object Settings {
     object DetectionMode {
@@ -73,7 +69,7 @@ object Settings {
 
 /**
  * Frame processor optimized to:
- *  - Reuse CoroutineScope, TensorImage, output arrays, Mat, Bitmaps
+ *  - Reuse CoroutineScope, output arrays, Mat, and drawing bitmaps
  *  - Avoid allocations in hot loops
  *  - Guard OpenCV init
  */
@@ -82,8 +78,29 @@ class VideoProcessor(private val context: Context) {
     private val tag = "VideoProcessor"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    // --- Reusable TFLite input/output holders ---
-    private val tensorImage = TensorImage(DataType.FLOAT32)
+    private val processingMutex = Mutex()
+    private val measurementLock = Any()
+    private var generation = 0
+    private var latestSample: LedDistanceSample? = null
+    @Volatile private var closed = false
+
+    fun resetMeasurements() = synchronized(measurementLock) {
+        generation++
+        latestSample = null
+    }
+
+    fun close() {
+        closed = true
+        resetMeasurements()
+        scope.launch {
+            processingMutex.withLock {
+                if (::workMat.isInitialized) workMat.release()
+                reusedOutBitmap?.recycle()
+                reusedOutBitmap = null
+            }
+            scope.cancel()
+        }
+    }
 
     // interpreter output shape, default small placeholder until first run
     private var outShape: IntArray = intArrayOf(1, 1, 8)
@@ -112,17 +129,25 @@ class VideoProcessor(private val context: Context) {
         }
     }
 
-    fun processFrame(bitmap: Bitmap, callback: (Pair<Bitmap, Bitmap>?) -> Unit) {
+    fun processFrame(bitmap: Bitmap, callback: (Bitmap?) -> Unit) {
+        if (closed) return
+        val frameGeneration = synchronized(measurementLock) { generation }
         scope.launch {
             val result = try {
-                when (Settings.DetectionMode.current) {
-                    Settings.DetectionMode.Mode.YOLO -> processFrameInternalYOLO(bitmap)
+                processingMutex.withLock {
+                    if (closed) null else processFrameInternalYOLO(bitmap, frameGeneration)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                Log.d(tag, "Error processing frame: ${e.message}", e)
+                Log.e(tag, "Error processing frame: ${e.message}", e)
                 null
+            } finally {
+                bitmap.recycle()
             }
-            withContext(Dispatchers.Main) { callback(result) }
+            withContext(Dispatchers.Main) {
+                if (!closed) callback(result)
+            }
         }
     }
 
@@ -147,8 +172,9 @@ class VideoProcessor(private val context: Context) {
     }
 
     private suspend fun processFrameInternalYOLO(
-        bitmap: Bitmap
-    ): Pair<Bitmap, Bitmap>? = withContext(Dispatchers.Default) {
+        bitmap: Bitmap,
+        frameGeneration: Int
+    ): Bitmap? = withContext(Dispatchers.Default) {
         if (!opencvLoaded.get()) return@withContext null
 
         // 1) Prepare 640×640 input
@@ -160,13 +186,13 @@ class VideoProcessor(private val context: Context) {
         Utils.bitmapToMat(inputBitmap, workMat)
 
         // 3) Load shared TFLite input
-        tensorImage.load(inputBitmap)
+        val input = BitmapToFloatTensor.nhwc(inputBitmap, YOLOLEDHelper.INPUT_SIZE)
 
         // -------------------- LED MODEL (multi-box) --------------------
         val ledInterp = YOLOLEDHelper.ensureInterpreter(context)
         ensureOutputBuffers(ledInterp) // keeps distOut sized for (LED head) shape
         synchronized(ledInterp) {
-            ledInterp.run(tensorImage.buffer, distOut)
+            ledInterp.run(input, distOut)
         }
 
         val rawLedDetections = YOLOLEDHelper.parseTFLite(
@@ -186,14 +212,15 @@ class VideoProcessor(private val context: Context) {
         val distShape = distInterp.getOutputTensor(0).shape() // e.g., [1,84,8400] or [1,8400,84]
         val distHead = Array(distShape[0]) { Array(distShape[1]) { FloatArray(distShape[2]) } }
         synchronized(distInterp) {
-            distInterp.run(tensorImage.buffer, distHead)
+            input.rewind()
+            distInterp.run(input, distHead)
         }
         val distDets: List<DetectionResult> =
             YOLODISTANCEHelper.parseTFLite(
                 raw = distHead,
                 confidenceThreshold = Settings.Inference.confidenceThreshold,
                 multiLabelPerBox = Settings.Inference.multiLabelPerBox,
-                expectedClasses = 3,
+                expectedClasses = YOLODISTANCEHelper.NUM_CLASSES,
                 classAgnosticNms = true
             )
                 .sortedByDescending { YOLODISTANCEHelper.getConfidence(it) }
@@ -366,15 +393,15 @@ class VideoProcessor(private val context: Context) {
             }
         }
 
-        ledDistSamples += LedDistanceSample(
-            tMillis = nowMs,
-            led1 = ledCenters[0],
-            led2 = ledCenters[1],
-            led3 = ledCenters[2],
-            dist1Cm = distPerLedCm[0],
-            dist2Cm = distPerLedCm[1],
-            dist3Cm = distPerLedCm[2]
-        )
+        synchronized(measurementLock) {
+            if (!closed && frameGeneration == generation) {
+                latestSample = LedDistanceSample(
+                    tMillis = nowMs,
+                    led1 = ledCenters[0], led2 = ledCenters[1], led3 = ledCenters[2],
+                    dist1Cm = distPerLedCm[0], dist2Cm = distPerLedCm[1], dist3Cm = distPerLedCm[2]
+                )
+            }
+        }
 
         // 6) Convert Mat → Bitmap safely
         val matW = workMat.cols()
@@ -387,37 +414,20 @@ class VideoProcessor(private val context: Context) {
         }
         Utils.matToBitmap(workMat, annotated)
 
-        // Return (annotated overlay, and the 640×640 model input)
-        annotated to inputBitmap
+        // Return an immutable snapshot of the annotated frame.
+        // The UI owns this copy; a later frame must not mutate a displayed bitmap.
+        val output = annotated.copy(Bitmap.Config.ARGB_8888, false)
+        if (inputBitmap !== bitmap) inputBitmap.recycle()
+        output
     }
 
     fun writeLedDistLogToFile(): File? {
-        fun fmtCoordBraced(pt: Pair<Int, Int>?): String =
-            if (pt == null) "{x=N/A, y=N/A}" else "{x=${pt.first}, y=${pt.second}}"
-
-        fun fmtDistanceBraced(v: Double?): String =
-            if (v == null) "{N/A}" else "{${v.toInt()} CM}"
-
-        val name = "LiFind_Log.txt"
-        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-        if (!docsDir.exists()) docsDir.mkdirs()
-
-        val outFile = File(docsDir, name)
-        try {
-            PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
-                synchronized(ledDistSamples) {
-                    val s = ledDistSamples.lastOrNull() ?: return@use
-                    out.println("LED_1 -> Coordinates: {x=0, y=2} - Distance: ${fmtDistanceBraced(s.dist1Cm)}")
-                    out.println("LED_2 -> Coordinates: {x=2, y=-2} - Distance: ${fmtDistanceBraced(s.dist2Cm)}")
-                    out.println("LED_3 -> Coordinates: {x=-2, y=-2} - Distance: ${fmtDistanceBraced(s.dist3Cm)}")
-                }
-            }
-            return outFile
-        } catch (t: Throwable) {
-            Log.e("LedDistLogger", "Failed to write log", t)
-            return null
-        } finally {
-            resetLedDistLogBuffer()
+        val sample = synchronized(measurementLock) { latestSample }
+        return try {
+            LedMeasurementStore.write(context, listOf(sample?.dist1Cm, sample?.dist2Cm, sample?.dist3Cm))
+        } catch (error: Exception) {
+            Log.e("LedDistLogger", "Failed to write log", error)
+            null
         }
     }
 }

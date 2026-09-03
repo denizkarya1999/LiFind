@@ -29,6 +29,7 @@ class SettingsActivity : AppCompatActivity() {
             isoPref?.setOnBindEditTextListener { edit ->
                 // numeric only from XML; optionally add min/max hints
                 edit.hint = "100–6400"
+                edit.inputType = android.text.InputType.TYPE_CLASS_NUMBER
             }
 
             isoPref?.setOnPreferenceChangeListener { _, newValue ->
@@ -47,7 +48,7 @@ class SettingsActivity : AppCompatActivity() {
                     // Store the (soft) clamped value
                     isoPref.text = clamped.toString()
                     Toast.makeText(context, "ISO set to $clamped", Toast.LENGTH_SHORT).show()
-                    true
+                    false // The normalized value was already persisted above.
                 }
             }
         }

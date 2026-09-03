@@ -54,9 +54,10 @@ object YOLOLEDHelper {
     }
 
     private fun loadModelFromAssets(context: Context, assetName: String): MappedByteBuffer {
-        val afd = context.assets.openFd(assetName)
-        FileInputStream(afd.fileDescriptor).channel.use { ch ->
-            return ch.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+        context.assets.openFd(assetName).use { afd ->
+            FileInputStream(afd.fileDescriptor).channel.use { ch ->
+                return ch.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
+            }
         }
     }
 
@@ -129,7 +130,8 @@ object YOLOLEDHelper {
     private fun applyNms(
         candidates: MutableList<DetectionResult>,
         expectedClasses: Int,
-        classAgnosticNms: Boolean
+        classAgnosticNms: Boolean,
+        iouThreshold: Float = Settings.Inference.iouThreshold
     ): List<DetectionResult> {
         if (candidates.isEmpty()) return emptyList()
 
@@ -161,7 +163,7 @@ object YOLOLEDHelper {
             area[i] = wA * hA
         }
 
-        val iouThresh = Settings.Inference.iouThreshold
+        val iouThresh = iouThreshold
         val removed = BooleanArray(n)
         val kept = ArrayList<DetectionResult>(n)
 
@@ -229,9 +231,11 @@ object YOLOLEDHelper {
         confidenceThreshold: Float,
         classAgnosticNms: Boolean,
         multiLabelPerBox: Boolean,
-        expectedClasses: Int
+        expectedClasses: Int,
+        iouThreshold: Float = Settings.Inference.iouThreshold
     ): List<DetectionResult> {
 
+        if (raw.isEmpty() || raw[0].isEmpty() || raw[0][0].isEmpty()) return emptyList()
         val b = raw[0]
         val d1 = b.size
         val d2 = b[0].size
@@ -342,7 +346,7 @@ object YOLOLEDHelper {
 
             // If your export already includes NMS, you can return candidates directly.
             // To keep behavior consistent, we still optionally apply NMS:
-            return applyNms(candidates, expectedClasses, classAgnosticNms)
+            return applyNms(candidates, expectedClasses, classAgnosticNms, iouThreshold)
         }
 
         // ---- Case B: raw head (4+K or 5+K) ----
@@ -463,6 +467,6 @@ object YOLOLEDHelper {
             }
         }
 
-        return applyNms(candidates, expectedClasses, classAgnosticNms)
+        return applyNms(candidates, expectedClasses, classAgnosticNms, iouThreshold)
     }
 }

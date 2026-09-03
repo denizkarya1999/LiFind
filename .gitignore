@@ -13,3 +13,6 @@ env/
 */venv/
 */env/
 */.venv/
+
+# Generated files from the legacy OpenCV source module.
+/LiFind/OpenCV-4.10.0/build/

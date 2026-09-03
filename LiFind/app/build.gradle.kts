@@ -11,11 +11,12 @@ android {
         applicationId = "com.developer27.lifind"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+            abiFilters += providers.gradleProperty("lifindTestAbi").orNull
+                ?.let { listOf(it) } ?: listOf("armeabi-v7a", "arm64-v8a")
         }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -45,63 +46,29 @@ android {
         viewBinding = true
     }
 
-    packaging {
-        jniLibs {
-            pickFirsts.add("lib/x86/libc++_shared.so")
-            pickFirsts.add("lib/x86_64/libc++_shared.so")
-            pickFirsts.add("lib/armeabi-v7a/libc++_shared.so")
-            pickFirsts.add("lib/arm64-v8a/libc++_shared.so")
-            pickFirsts.add("lib/arm64-v8a/libtensorflowlite_gpu_jni.so")
-            pickFirsts.add("lib/armeabi-v7a/libtensorflowlite_gpu_jni.so")
-        }
-    }
+    // Use the matching C++ runtime from OpenCV, not the obsolete vendored binary.
+    sourceSets.getByName("main").jniLibs.setSrcDirs(emptyList<String>())
 
-    aaptOptions {
-        noCompress("pt")
-        noCompress("torchscript")
-        noCompress("tflite")
+    androidResources {
+        // Ship only the models used by the app; retain training exports in the repository.
+        ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~:old_submission:lifind_new_distance_detection_original_yolo_26l.tflite:lifind_new_led_detection_original_yolo26l.tflite"
+        noCompress += "tflite"
     }
 }
 
 dependencies {
-    // OpenCV
-    implementation(project(":OpenCV-4.10.0")) {
-        exclude(group = "org.bytedeco", module = "libc++_shared")
-    }
-
-    // PyTorch
-    implementation("org.pytorch:pytorch_android:1.13.1") {
-        exclude(group = "org.bytedeco", module = "libc++_shared")
-    }
-    implementation("org.pytorch:pytorch_android_torchvision:1.13.1") {
-        exclude(group = "org.bytedeco", module = "libc++_shared")
-    }
-
-    // ML Kit, etc.
-    implementation("com.google.mlkit:vision-common:17.3.0")
-
-    // TensorFlow Lite (For GPU Utilization)
-    implementation("com.google.ai.edge.litert:litert:1.1.0") // Core TFLite runtime
-    implementation("com.google.ai.edge.litert:litert-gpu:1.1.0") // GPU acceleration
-    implementation("com.google.ai.edge.litert:litert-support:1.1.0") // Support library
-
-    // CameraX
-    val cameraxVersion = "1.2.2"
-    implementation("androidx.camera:camera-core:$cameraxVersion")
-    implementation("androidx.camera:camera-camera2:$cameraxVersion")
-    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
-    implementation("androidx.camera:camera-video:$cameraxVersion")
-    implementation("androidx.camera:camera-view:$cameraxVersion")
-    implementation("androidx.camera:camera-extensions:$cameraxVersion")
-
-    // Sceneform Community Fork (core + ux)
-    implementation("com.gorisse.thomas.sceneform:sceneform:1.19.6")
+    // Native runtimes with 16 KB page-size support.
+    implementation("org.opencv:opencv:4.14.0")
+    implementation("com.google.ai.edge.litert:litert:1.4.1")
 
     // Kotlin & Android core libs
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
     // Preferences
     implementation("androidx.preference:preference-ktx:1.2.1")
@@ -113,7 +80,4 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
-
-    // Apache Commons Math
-    implementation("org.apache.commons:commons-math3:3.6.1")
 }

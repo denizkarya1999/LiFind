@@ -1,4 +1,4 @@
-package com.developer27.lifind.routism
+package com.developer27.lifind
 
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -19,6 +19,6 @@ class ExampleInstrumentedTest {
     fun useAppContext() {
         // Context of the app under test.
         val appContext = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("com.developer27.xamera", appContext.packageName)
+        assertEquals("com.developer27.lifind", appContext.packageName)
     }
 }

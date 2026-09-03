@@ -16,11 +16,11 @@ import android.hardware.camera2.CaptureRequest
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import android.util.Size
 import android.view.MotionEvent
 import android.view.Surface
 import android.widget.Toast
-import androidx.annotation.RequiresPermission
 import com.developer27.lifind.MainActivity
 import com.developer27.lifind.databinding.ActivityMainBinding
 
@@ -76,7 +76,11 @@ class CameraHelper(
 
     // Zoom control
     private var zoomLevel = 1.0f
-    private val maxZoom = 10.0f
+    private var maxZoom = 1.0f
+    private val callbackHandler = Handler(activity.mainLooper)
+    private var cameraGeneration = 0
+    private var openingCamera = false
+    private var previewSurface: Surface? = null
 
     init {
         loadFacingFromPrefs()
@@ -96,24 +100,27 @@ class CameraHelper(
     /**
      * Callback for camera device events
      */
-    private val stateCallback = object : CameraDevice.StateCallback() {
+    private fun stateCallback(generation: Int) = object : CameraDevice.StateCallback() {
         override fun onOpened(camera: CameraDevice) {
-            // When camera is opened, store reference and create preview
+            if (generation != cameraGeneration) {
+                camera.close()
+                return
+            }
+            openingCamera = false
             cameraDevice = camera
             createCameraPreview()
         }
 
         override fun onDisconnected(camera: CameraDevice) {
-            // Close camera if disconnected
-            cameraDevice?.close()
-            cameraDevice = null
+            camera.close()
+            if (generation == cameraGeneration) closeCamera()
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
-            // Close on errors
-            cameraDevice?.close()
-            cameraDevice = null
-            activity.finish()
+            camera.close()
+            if (generation != cameraGeneration) return
+            closeCamera()
+            Toast.makeText(activity, "Camera unavailable. Tap Clear to retry.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -121,6 +128,7 @@ class CameraHelper(
     // Background Thread Setup
     // ------------------------------------------------------------------------
     fun startBackgroundThread() {
+        if (backgroundThread != null) return
         backgroundThread = HandlerThread("CameraBackground").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
@@ -144,7 +152,6 @@ class CameraHelper(
      * Persisted to SharedPreferences and restarts camera safely.
      */
     @SuppressLint("MissingPermission")
-    @RequiresPermission(Manifest.permission.CAMERA)
     fun setFrontCameraEnabled(enabled: Boolean) {
         if (isFrontCamera == enabled) return
         isFrontCamera = enabled
@@ -156,7 +163,6 @@ class CameraHelper(
      * Call this from UI (button) to toggle front/back.
      */
     @SuppressLint("MissingPermission")
-    @RequiresPermission(Manifest.permission.CAMERA)
     fun toggleCameraFacing() {
         isFrontCamera = !isFrontCamera
         saveFacingToPrefs(isFrontCamera)
@@ -164,7 +170,6 @@ class CameraHelper(
     }
 
     @SuppressLint("MissingPermission")
-    @RequiresPermission(Manifest.permission.CAMERA)
     private fun restartCamera() {
         // reset zoom (optional safety when switching cameras)
         zoomLevel = 1.0f
@@ -178,8 +183,8 @@ class CameraHelper(
     // Open/Close Camera
     // ------------------------------------------------------------------------
     @SuppressLint("MissingPermission")
-    @RequiresPermission(Manifest.permission.CAMERA)
     fun openCamera() {
+        if (openingCamera || cameraDevice != null || !viewBinding.viewFinder.isAvailable) return
         try {
             // Decide which camera (front/back)
             val cameraId = getCameraId()
@@ -187,6 +192,8 @@ class CameraHelper(
 
             // Grab the full sensor area for zoom
             sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            maxZoom = (characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f).coerceAtLeast(1f)
+            zoomLevel = zoomLevel.coerceIn(1f, maxZoom)
 
             // Possible output sizes
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -197,20 +204,25 @@ class CameraHelper(
             videoSize = chooseOptimalSize(map.getOutputSizes(MediaRecorder::class.java))
 
             // Now open the selected camera
-            cameraManager.openCamera(cameraId, stateCallback, backgroundHandler)
-        } catch (e: CameraAccessException) {
-            e.printStackTrace()
-        } catch (e: SecurityException) {
-            e.printStackTrace()
-            Toast.makeText(activity, "Camera permission needed.", Toast.LENGTH_SHORT).show()
+            openingCamera = true
+            cameraManager.openCamera(cameraId, stateCallback(cameraGeneration), callbackHandler)
+        } catch (e: Exception) {
+            openingCamera = false
+            Log.e("CameraHelper", "Could not open camera", e)
+            Toast.makeText(activity, "Camera unavailable. Check camera permission and retry.", Toast.LENGTH_SHORT).show()
         }
     }
 
     fun closeCamera() {
+        cameraGeneration++
+        openingCamera = false
         cameraCaptureSession?.close()
         cameraCaptureSession = null
         cameraDevice?.close()
         cameraDevice = null
+        captureRequestBuilder = null
+        previewSurface?.release()
+        previewSurface = null
     }
 
     // ------------------------------------------------------------------------
@@ -222,7 +234,9 @@ class CameraHelper(
             // Match the texture view size to the chosen preview size
             previewSize?.let { texture.setDefaultBufferSize(it.width, it.height) }
 
-            val previewSurface = Surface(texture)
+            val camera = cameraDevice ?: return
+            val generation = cameraGeneration
+            val previewSurface = Surface(texture).also { this.previewSurface = it }
             // Build a preview request
             captureRequestBuilder = cameraDevice?.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             // Add the preview surface as a target
@@ -258,13 +272,18 @@ class CameraHelper(
                 listOf(previewSurface),
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        if (cameraDevice == null) return
+                        if (generation != cameraGeneration || cameraDevice !== camera) {
+                            session.close()
+                            return
+                        }
                         // Save the session
                         cameraCaptureSession = session
                         updatePreview() // Start the preview
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
+                        session.close()
+                        if (generation != cameraGeneration) return
                         Toast.makeText(
                             activity,
                             "Preview config failed.",
@@ -272,7 +291,7 @@ class CameraHelper(
                         ).show()
                     }
                 },
-                backgroundHandler
+                callbackHandler
             )
         } catch (e: CameraAccessException) {
             e.printStackTrace()
@@ -298,7 +317,7 @@ class CameraHelper(
             cameraCaptureSession?.setRepeatingRequest(
                 captureRequestBuilder!!.build(),
                 null,
-                backgroundHandler
+                callbackHandler
             )
         } catch (e: CameraAccessException) {
             e.printStackTrace()
@@ -326,9 +345,9 @@ class CameraHelper(
         }
 
         return if (isFrontCamera) {
-            frontId ?: backId ?: cameraManager.cameraIdList.first()
+            frontId ?: backId ?: cameraManager.cameraIdList.firstOrNull() ?: error("No camera available")
         } else {
-            backId ?: frontId ?: cameraManager.cameraIdList.first()
+            backId ?: frontId ?: cameraManager.cameraIdList.firstOrNull() ?: error("No camera available")
         }
     }
 
@@ -342,7 +361,7 @@ class CameraHelper(
             return found720p
         }
         // fallback to the smallest
-        return choices.minByOrNull { it.width * it.height } ?: choices[0]
+        return choices.minByOrNull { it.width * it.height } ?: error("No supported preview sizes")
     }
 
     // ------------------------------------------------------------------------
@@ -357,11 +376,11 @@ class CameraHelper(
             CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR
         ) == true
 
-        val shutterFps = sharedPreferences.getString("shutter_speed", "15")?.toIntOrNull() ?: 15
+        val shutterFps = sharedPreferences.getString("shutter_speed", "60")?.toIntOrNull() ?: 60
         val shutterValueNs = if (shutterFps > 0) 1_000_000_000L / shutterFps else 0L
 
         // If no manual or user set 0, just do auto
-        if (!canManualExposure || shutterValueNs <= 0) {
+        if (!canManualExposure || shutterValueNs <= 0 || !sharedPreferences.getBoolean("manual_iso_enabled", true)) {
             setAutoExposure()
             return
         }
@@ -378,7 +397,7 @@ class CameraHelper(
 
         // Read ISO prefs
         val manualIsoEnabled = sharedPreferences.getBoolean("manual_iso_enabled", true)
-        val isoFromPrefs = sharedPreferences.getString("iso_value", "100")?.toIntOrNull() ?: 100
+        val isoFromPrefs = sharedPreferences.getString("iso_value", "800")?.toIntOrNull() ?: 800
         val safeISO = isoFromPrefs.coerceIn(isoRange.lower, isoRange.upper)
 
         // Fully manual exposure; if manual ISO disabled, we still must set *some* ISO because AE is off.
@@ -386,7 +405,7 @@ class CameraHelper(
         val isoToUse = if (manualIsoEnabled) safeISO else
             ((isoRange.lower + isoRange.upper) / 2).coerceIn(isoRange.lower, isoRange.upper)
 
-        captureRequestBuilder?.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF)
+        captureRequestBuilder?.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         captureRequestBuilder?.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
         captureRequestBuilder?.set(CaptureRequest.SENSOR_EXPOSURE_TIME, safeExposureNs)
         captureRequestBuilder?.set(CaptureRequest.SENSOR_SENSITIVITY, isoToUse)
@@ -401,12 +420,13 @@ class CameraHelper(
      * If user changes shutter speed in settings, we re-apply
      */
     fun updateShutterSpeed() {
+        if (cameraDevice == null || captureRequestBuilder == null) return
         applyRollingShutter()
         try {
             cameraCaptureSession?.setRepeatingRequest(
                 captureRequestBuilder!!.build(),
                 null,
-                backgroundHandler
+                callbackHandler
             )
         } catch (e: CameraAccessException) {
             e.printStackTrace()
@@ -469,7 +489,7 @@ class CameraHelper(
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    zoomHandler.removeCallbacks(zoomInRunnable!!)
+                    zoomInRunnable?.let { zoomHandler.removeCallbacks(it) }
                     true
                 }
                 else -> false
@@ -490,7 +510,7 @@ class CameraHelper(
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    zoomHandler.removeCallbacks(zoomOutRunnable!!)
+                    zoomOutRunnable?.let { zoomHandler.removeCallbacks(it) }
                     true
                 }
                 else -> false
@@ -500,14 +520,14 @@ class CameraHelper(
 
     private fun zoomIn() {
         if (zoomLevel < maxZoom) {
-            zoomLevel += 0.1f
+            zoomLevel = (zoomLevel + 0.1f).coerceAtMost(maxZoom)
             applyZoom()
         }
     }
 
     private fun zoomOut() {
         if (zoomLevel > 1.0f) {
-            zoomLevel -= 0.1f
+            zoomLevel = (zoomLevel - 0.1f).coerceAtLeast(1f)
             applyZoom()
         }
     }
@@ -521,8 +541,8 @@ class CameraHelper(
         val croppedWidth = sensorArraySize!!.width() * ratio
         val croppedHeight = sensorArraySize!!.height() * ratio
 
-        val left = ((sensorArraySize!!.width() - croppedWidth) / 2).toInt()
-        val top = ((sensorArraySize!!.height() - croppedHeight) / 2).toInt()
+        val left = sensorArraySize!!.left + ((sensorArraySize!!.width() - croppedWidth) / 2).toInt()
+        val top = sensorArraySize!!.top + ((sensorArraySize!!.height() - croppedHeight) / 2).toInt()
         val right = (left + croppedWidth).toInt()
         val bottom = (top + croppedHeight).toInt()
 
@@ -533,7 +553,7 @@ class CameraHelper(
             cameraCaptureSession?.setRepeatingRequest(
                 captureRequestBuilder!!.build(),
                 null,
-                backgroundHandler
+                callbackHandler
             )
         } catch (e: CameraAccessException) {
             e.printStackTrace()

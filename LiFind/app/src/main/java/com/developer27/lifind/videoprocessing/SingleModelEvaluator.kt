@@ -16,6 +16,9 @@ import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
@@ -29,17 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 
-/**
- * Global inference thresholds (set once from anywhere).
- *
- * IMPORTANT:
- * - YOLOLEDHelper.applyNms() reads Settings.Inference.iouThreshold
- * - YOLODISTANCEHelper.applyNms() reads Settings.Inference.iouThreshold
- *
- * This file includes a best-effort sync so InferenceConfig also updates
- * Settings.Inference.* if those are mutable vars. If Settings uses val getters,
- * the sync will be ignored safely.
- */
+/** Evaluation thresholds are independent of live tracking settings. */
 object InferenceConfig {
     @Volatile var confidenceThreshold: Float = 0.001f
     @Volatile var iouThreshold: Float = 0.25f
@@ -177,7 +170,6 @@ object SingleModelEvaluator {
                 initialMsg = "Preparing..."
             )
 
-            syncSettingsFromInferenceConfig()
 
             val k = when (model) {
                 ModelType.LED -> YOLOLEDHelper.labels.size
@@ -203,7 +195,9 @@ object SingleModelEvaluator {
 
             progressDialog?.update(msg = "Done.", progressPercent = 100)
             results
-        } catch (t: Throwable) {
+        } catch (t: CancellationException) {
+            throw t
+        } catch (t: Exception) {
             Log.e(TAG, "evaluateTrainValTest failed", t)
             null
         } finally {
@@ -291,139 +285,87 @@ object SingleModelEvaluator {
         onProgress: (split: String, done: Int, total: Int) -> Unit
     ): SplitResult = withContext(Dispatchers.IO) {
 
-        syncSettingsFromInferenceConfig()
 
         val workDir = File(context.cacheDir, "lifind_eval_${model.name.lowercase()}_$splitName").apply {
             deleteRecursively()
             mkdirs()
         }
 
-        val zipFile = File(workDir, "$splitName.zip")
-        copyUriToFile(context.contentResolver, zipUri, zipFile)
+        try {
+            val zipFile = File(workDir, "$splitName.zip")
+            copyUriToFile(context.contentResolver, zipUri, zipFile)
 
-        val unzipDir = File(workDir, "unzipped").apply { mkdirs() }
-        unzip(zipFile, unzipDir)
+            val unzipDir = File(workDir, "unzipped").apply { mkdirs() }
+            unzip(zipFile, unzipDir)
 
-        val images = unzipDir.walkTopDown()
-            .filter { it.isFile && it.extension.lowercase() in setOf("jpg", "jpeg", "png") }
-            .toList()
+            val images = unzipDir.walkTopDown()
+                .filter { it.isFile && it.extension.lowercase() in setOf("jpg", "jpeg", "png") }
+                .toList()
 
-        Log.d(TAG, "Split=$splitName images_found=${images.size} root=${unzipDir.absolutePath}")
+            Log.d(TAG, "Split=$splitName images_found=${images.size} root=${unzipDir.absolutePath}")
 
-        val size = if (includeNone) classCount + 1 else classCount
-        val matrix = Array(size) { IntArray(size) }
-        val noneIdx = if (includeNone) classCount else -1
+            val metrics = DetectionMetrics(classCount, includeNone)
+            var skippedNoLabelImgs = 0
+            var skippedDecodeFailImgs = 0
+            var totalGtBoxes = 0
 
-        var skippedNoLabelImgs = 0
-        var skippedDecodeFailImgs = 0
+            require(images.isNotEmpty()) { "No supported images in $splitName ZIP." }
+            for ((idx, imgFile) in images.withIndex()) {
+                currentCoroutineContext().ensureActive()
+                val bmp = decodeBitmap(imgFile)
+                if (bmp == null) {
+                    skippedDecodeFailImgs++
+                    Log.w(TAG, "Decode failed: ${imgFile.absolutePath}")
+                    onProgress(splitName, idx + 1, images.size)
+                    continue
+                }
 
-        var totalGtBoxes = 0
-        var matched = 0
-        var missed = 0
-        var falsePos = 0
+                // Read ALL gt boxes (multiple lines) for this image
+                val gtBoxes = readGtBoxesForImage(unzipDir, imgFile)
+                if (gtBoxes == null) {
+                    skippedNoLabelImgs++
+                    bmp.recycle()
+                    Log.w(TAG, "No label for image: ${imgFile.absolutePath}")
+                    onProgress(splitName, idx + 1, images.size)
+                    continue
+                }
 
-        for ((idx, imgFile) in images.withIndex()) {
-            val bmp = decodeBitmap(imgFile)
-            if (bmp == null) {
-                skippedDecodeFailImgs++
-                Log.w(TAG, "Decode failed: ${imgFile.absolutePath}")
-                onProgress(splitName, idx + 1, images.size)
-                continue
-            }
+                totalGtBoxes += gtBoxes.size
 
-            // Read ALL gt boxes (multiple lines) for this image
-            val gtBoxes = readGtBoxesForImage(unzipDir, imgFile)
-            if (gtBoxes == null) {
-                skippedNoLabelImgs++
-                Log.w(TAG, "No label for image: ${imgFile.absolutePath}")
-                onProgress(splitName, idx + 1, images.size)
-                continue
-            }
+                // Run inference -> multiple predicted boxes
+                val predDetections = try {
+                    when (model) {
+                        ModelType.LED -> inferLedDetections(context, bmp)
+                        ModelType.DISTANCE -> inferDistanceDetections(context, bmp)
+                    }
+                } finally {
+                    bmp.recycle()
+                }
 
-            totalGtBoxes += gtBoxes.size
-
-            // Run inference -> multiple predicted boxes
-            val predDetections = when (model) {
-                ModelType.LED -> inferLedDetections(context, bmp)
-                ModelType.DISTANCE -> inferDistanceDetections(context, bmp)
-            }
-
-            // Convert predictions to Box (normalized xywh)
-            val predBoxes = predDetections.map { d ->
-                Box(
-                    classId = d.classId,
-                    xc = d.xCenter,
-                    yc = d.yCenter,
-                    w = d.width,
-                    h = d.height
+                metrics.addImage(
+                    gtBoxes.map { DetectionResult(it.xc, it.yc, it.w, it.h, 1f, it.classId) },
+                    predDetections,
+                    InferenceConfig.matchIouThreshold
                 )
-            }.toMutableList()
 
-            // Match GT boxes to predictions (one-to-one) using IoU threshold
-            // - Prefer matching SAME CLASS first (standard for detection confusion)
-            // - Each prediction can match at most one GT
-            val predUsed = BooleanArray(predBoxes.size)
-
-            for (gt in gtBoxes) {
-                val gtCls = gt.classId.coerceIn(0, classCount - 1)
-
-                var bestJ = -1
-                var bestIou = 0f
-
-                for (j in predBoxes.indices) {
-                    if (predUsed[j]) continue
-                    val pr = predBoxes[j]
-
-                    // By default we match by class (recommended).
-                    // If you want class-agnostic matching, remove this check.
-                    if (pr.classId != gtCls) continue
-
-                    val iou = iouXYWH(gt, pr)
-                    if (iou >= InferenceConfig.matchIouThreshold && iou > bestIou) {
-                        bestIou = iou
-                        bestJ = j
-                    }
-                }
-
-                if (bestJ >= 0) {
-                    predUsed[bestJ] = true
-                    val prCls = predBoxes[bestJ].classId.coerceIn(0, classCount - 1)
-                    matrix[gtCls][prCls]++
-                    matched++
-                } else {
-                    // No matching prediction for this GT
-                    missed++
-                    if (includeNone) {
-                        matrix[gtCls][noneIdx]++
-                    }
-                }
+                onProgress(splitName, idx + 1, images.size)
             }
 
-            // Any remaining predictions are false positives (GT = NONE)
-            if (includeNone) {
-                for (j in predBoxes.indices) {
-                    if (predUsed[j]) continue
-                    val prCls = predBoxes[j].classId.coerceIn(0, classCount - 1)
-                    matrix[noneIdx][prCls]++
-                    falsePos++
-                }
-            }
-
-            onProgress(splitName, idx + 1, images.size)
+            SplitResult(
+                splitName = splitName,
+                classCount = classCount,
+                includeNone = includeNone,
+                matrix = metrics.matrix,
+                totalGtBoxes = totalGtBoxes,
+                skippedNoLabel = skippedNoLabelImgs,
+                skippedDecodeFail = skippedDecodeFailImgs,
+                matched = metrics.matched,
+                missed = metrics.missed,
+                falsePositives = metrics.falsePositives
+            )
+        } finally {
+            workDir.deleteRecursively()
         }
-
-        SplitResult(
-            splitName = splitName,
-            classCount = classCount,
-            includeNone = includeNone,
-            matrix = matrix,
-            totalGtBoxes = totalGtBoxes,
-            skippedNoLabel = skippedNoLabelImgs,
-            skippedDecodeFail = skippedDecodeFailImgs,
-            matched = matched,
-            missed = missed,
-            falsePositives = falsePos
-        )
     }
 
     // -------------------- inference (use helpers) --------------------
@@ -438,14 +380,18 @@ object SingleModelEvaluator {
         val s = outTensor.shape()
         val out = Array(s[0]) { Array(s[1]) { FloatArray(s[2]) } }
 
-        interpreter.run(input, out)
+        synchronized(interpreter) {
+            interpreter.run(input, out)
+        }
+        if (inputBmp !== src) inputBmp.recycle()
 
         return YOLOLEDHelper.parseTFLite(
             raw = out,
             confidenceThreshold = InferenceConfig.confidenceThreshold,
             classAgnosticNms = InferenceConfig.classAgnosticNms,
             multiLabelPerBox = InferenceConfig.multiLabelPerBox,
-            expectedClasses = YOLOLEDHelper.labels.size
+            expectedClasses = YOLOLEDHelper.labels.size,
+            iouThreshold = InferenceConfig.iouThreshold
         )
     }
 
@@ -459,14 +405,18 @@ object SingleModelEvaluator {
         val s = outTensor.shape()
         val out = Array(s[0]) { Array(s[1]) { FloatArray(s[2]) } }
 
-        interpreter.run(input, out)
+        synchronized(interpreter) {
+            interpreter.run(input, out)
+        }
+        if (inputBmp !== src) inputBmp.recycle()
 
         return YOLODISTANCEHelper.parseTFLite(
             raw = out,
             confidenceThreshold = InferenceConfig.confidenceThreshold,
             classAgnosticNms = InferenceConfig.classAgnosticNms,
             multiLabelPerBox = InferenceConfig.multiLabelPerBox,
-            expectedClasses = YOLODISTANCEHelper.NUM_CLASSES
+            expectedClasses = YOLODISTANCEHelper.NUM_CLASSES,
+            iouThreshold = InferenceConfig.iouThreshold
         )
     }
 
@@ -560,33 +510,6 @@ object SingleModelEvaluator {
 
     // -------------------- IoU (xywh normalized) --------------------
 
-    private fun iouXYWH(a: Box, b: Box): Float {
-        val ax1 = a.xc - 0.5f * a.w
-        val ay1 = a.yc - 0.5f * a.h
-        val ax2 = a.xc + 0.5f * a.w
-        val ay2 = a.yc + 0.5f * a.h
-
-        val bx1 = b.xc - 0.5f * b.w
-        val by1 = b.yc - 0.5f * b.h
-        val bx2 = b.xc + 0.5f * b.w
-        val by2 = b.yc + 0.5f * b.h
-
-        val x1 = maxOf(ax1, bx1)
-        val y1 = maxOf(ay1, by1)
-        val x2 = minOf(ax2, bx2)
-        val y2 = minOf(ay2, by2)
-
-        val iw = (x2 - x1).coerceAtLeast(0f)
-        val ih = (y2 - y1).coerceAtLeast(0f)
-        val inter = iw * ih
-
-        val areaA = (ax2 - ax1).coerceAtLeast(0f) * (ay2 - ay1).coerceAtLeast(0f)
-        val areaB = (bx2 - bx1).coerceAtLeast(0f) * (by2 - by1).coerceAtLeast(0f)
-        val denom = areaA + areaB - inter
-
-        return if (denom > 0f) inter / denom else 0f
-    }
-
     // -------------------- IO helpers --------------------
 
     private fun decodeBitmap(file: File): Bitmap? =
@@ -599,7 +522,7 @@ object SingleModelEvaluator {
         }
     }
 
-    private fun unzip(zipFile: File, destDir: File) {
+    internal fun unzip(zipFile: File, destDir: File) {
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             var entry: ZipEntry? = zis.nextEntry
             while (entry != null) {
@@ -609,7 +532,7 @@ object SingleModelEvaluator {
                 // ZipSlip protection
                 val canonicalDest = destDir.canonicalPath
                 val canonicalOut = outFile.canonicalPath
-                require(canonicalOut.startsWith(canonicalDest)) { "Blocked ZipSlip: ${entry!!.name}" }
+                require(canonicalOut.startsWith(canonicalDest + File.separator)) { "Blocked ZipSlip: ${entry!!.name}" }
 
                 if (entry.isDirectory) {
                     outFile.mkdirs()
@@ -654,28 +577,4 @@ object SingleModelEvaluator {
         }
     }
 
-    // -------------------- settings sync --------------------
-
-    private fun syncSettingsFromInferenceConfig() {
-        try {
-            val inferenceCls = Class.forName("com.developer27.lifind.videoprocessing.Settings\$Inference")
-            val instance = inferenceCls.getField("INSTANCE").get(null)
-
-            fun callSetter(name: String, arg: Any) {
-                try {
-                    val m = inferenceCls.methods.firstOrNull { it.name == name } ?: return
-                    m.invoke(instance, arg)
-                } catch (_: Throwable) {
-                    // ignore
-                }
-            }
-
-            callSetter("setConfidenceThreshold", InferenceConfig.confidenceThreshold)
-            callSetter("setIouThreshold", InferenceConfig.iouThreshold)
-            callSetter("setClassAgnosticNms", InferenceConfig.classAgnosticNms)
-            callSetter("setMultiLabelPerBox", InferenceConfig.multiLabelPerBox)
-        } catch (_: Throwable) {
-            // ignore
-        }
-    }
 }

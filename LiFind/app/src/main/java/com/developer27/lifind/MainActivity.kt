@@ -11,8 +11,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
-import android.preference.PreferenceManager
+import androidx.preference.PreferenceManager
 import android.text.InputType
 import android.util.Log
 import android.util.SparseIntArray
@@ -35,13 +34,12 @@ import androidx.lifecycle.lifecycleScope
 import com.developer27.lifind.camera.CameraHelper
 import com.developer27.lifind.databinding.ActivityMainBinding
 import com.developer27.lifind.trilateration.MapActivity
+import com.developer27.lifind.trilateration.LedLayout
+import com.developer27.lifind.trilateration.LedMeasurementStore
 import com.developer27.lifind.videoprocessing.SingleModelEvaluator
 import com.developer27.lifind.videoprocessing.VideoProcessor
 import kotlinx.coroutines.launch
-import java.io.BufferedWriter
 import java.io.File
-import java.io.FileWriter
-import java.io.PrintWriter
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -52,10 +50,18 @@ class MainActivity : AppCompatActivity() {
     private var isRecording = false
     private var isProcessing = false
     private var isProcessingFrame = false
+    private var activityResumed = false
+    private var permissionRequested = false
+    private var frameGeneration = 0
+    private var pendingMap = false
+    private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key in setOf("shutter_speed", "iso_value", "manual_iso_enabled")) {
+            cameraHelper.updateShutterSpeed()
+        }
+    }
 
     private val REQUIRED_PERMISSIONS = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO
+        Manifest.permission.CAMERA
     )
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<Array<String>>
@@ -88,14 +94,13 @@ class MainActivity : AppCompatActivity() {
     private val textureListener = object : TextureView.SurfaceTextureListener {
         @SuppressLint("MissingPermission")
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            if (allPermissionsGranted()) {
-                cameraHelper.openCamera()
-            } else {
-                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-            }
+            if (activityResumed && allPermissionsGranted()) cameraHelper.openCamera()
         }
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = false
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            cameraHelper.closeCamera()
+            return true
+        }
         override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
             if (isProcessing) processFrameWithVideoProcessor()
         }
@@ -125,31 +130,17 @@ class MainActivity : AppCompatActivity() {
 
         requestPermissionLauncher =
             registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-                val camGranted = permissions[Manifest.permission.CAMERA] ?: false
-                val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-                if (camGranted && micGranted) {
-                    if (viewBinding.viewFinder.isAvailable) {
-                        cameraHelper.openCamera()
-                    } else {
-                        viewBinding.viewFinder.surfaceTextureListener = textureListener
-                    }
+                if (permissions[Manifest.permission.CAMERA] == true) {
+                    if (activityResumed && viewBinding.viewFinder.isAvailable) cameraHelper.openCamera()
                 } else {
-                    Toast.makeText(this, "Camera & Audio permissions are required.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Camera permission is required for tracking.", Toast.LENGTH_SHORT).show()
                 }
             }
-
-        if (allPermissionsGranted()) {
-            if (viewBinding.viewFinder.isAvailable) {
-                cameraHelper.openCamera()
-            } else {
-                viewBinding.viewFinder.surfaceTextureListener = textureListener
-            }
-        } else {
-            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-        }
+        viewBinding.viewFinder.surfaceTextureListener = textureListener
 
         // Switch camera button
         viewBinding.switchCameraButton.setOnClickListener {
+            resetTracking()
             if (allPermissionsGranted()) {
                 cameraHelper.toggleCameraFacing()
             } else {
@@ -218,12 +209,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         viewBinding.clearButton.setOnClickListener {
-            // 1) Clean overlay
-            viewBinding.processedFrameView.setImageDrawable(null)
-            viewBinding.processedFrameView.visibility = View.GONE
-            viewBinding.processedFrameView.invalidate()
-
-            // 2) Restart camera preview
+            resetTracking()
             restartCamera()
         }
 
@@ -235,11 +221,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         cameraHelper.setupZoomControls()
-        sharedPreferences.registerOnSharedPreferenceChangeListener { _, key ->
-            if (key == "shutter_speed") {
-                cameraHelper.updateShutterSpeed()
-            }
-        }
+        sharedPreferences.registerOnSharedPreferenceChangeListener(preferenceListener)
 
         viewBinding.viewMapButton.setOnClickListener {
             openMapActivity()
@@ -260,6 +242,8 @@ class MainActivity : AppCompatActivity() {
     // ZIP Evaluation helpers
     // ----------------------------
     private fun showModelPickerAndStartZipSelection() {
+        if (!viewBinding.evaluateZipButton.isEnabled) return
+        resetTracking()
         val options = arrayOf("LED Detection Model", "Distance Estimation Model")
         var selected = 0 // default = LED
 
@@ -316,7 +300,8 @@ class MainActivity : AppCompatActivity() {
 
             Toast.makeText(
                 this@MainActivity,
-                "Saved:\n" + files.joinToString("\n") { it.absolutePath },
+                if (files.size == results.size) "Saved:\n" + files.joinToString("\n") { it.absolutePath }
+                else "Could not save all evaluation reports.",
                 Toast.LENGTH_LONG
             ).show()
 
@@ -328,12 +313,15 @@ class MainActivity : AppCompatActivity() {
     private fun handlePickedMedia(uri: Uri) {
         val mimeType = contentResolver.getType(uri)
         if (mimeType?.startsWith("image") == true) {
-            val inputStream = contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(inputStream)
-            inputStream?.close()
-
+            val bitmap = runCatching {
+                contentResolver.openInputStream(uri).use { BitmapFactory.decodeStream(it) }
+            }.getOrNull()
+            if (bitmap == null) {
+                Toast.makeText(this, "Could not read this image.", Toast.LENGTH_SHORT).show()
+                return
+            }
             videoProcessor?.processFrame(bitmap) { processedFrames ->
-                processedFrames?.let { (outputBitmap, _) ->
+                processedFrames?.let { outputBitmap ->
                     viewBinding.processedFrameView.setImageBitmap(outputBitmap)
                     viewBinding.processedFrameView.visibility = View.VISIBLE
                 }
@@ -351,11 +339,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startProcessingAndRecording() {
+        if (!allPermissionsGranted()) {
+            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+            return
+        }
+        if (isProcessingFrame || pendingMap) return
+        videoProcessor?.resetMeasurements()
+        cameraHelper.openCamera()
         isRecording = true
         isProcessing = true
+        viewBinding.TakeSnapshotButton.isEnabled = false
         viewBinding.startProcessingButton.text = "Stop Tracking"
-        viewBinding.startProcessingButton.backgroundTintList =
-            ContextCompat.getColorStateList(this, R.color.red)
+        viewBinding.startProcessingButton.backgroundTintList = ContextCompat.getColorStateList(this, R.color.red)
         viewBinding.processedFrameView.visibility = View.VISIBLE
         viewBinding.processedFrameView.setImageBitmap(null)
     }
@@ -363,29 +358,48 @@ class MainActivity : AppCompatActivity() {
     private fun stopProcessingAndRecording() {
         isRecording = false
         isProcessing = false
+        pendingMap = true
+        viewBinding.startProcessingButton.isEnabled = false
+        if (!isProcessingFrame) finishTracking()
+    }
+
+    private fun finishTracking() {
+        if (!pendingMap) return
+        pendingMap = false
+        val saved = videoProcessor?.writeLedDistLogToFile() != null
+        resetTracking()
+        if (saved) openMapActivity()
+        else Toast.makeText(this, "Could not save distances.", Toast.LENGTH_LONG).show()
+    }
+
+    private fun resetTracking() {
+        frameGeneration++
+        pendingMap = false
+        isRecording = false
+        isProcessing = false
+        isProcessingFrame = false
+        videoProcessor?.resetMeasurements()
+        viewBinding.startProcessingButton.isEnabled = true
+        viewBinding.TakeSnapshotButton.isEnabled = true
         viewBinding.startProcessingButton.text = "Start Tracking"
-        viewBinding.startProcessingButton.backgroundTintList =
-            ContextCompat.getColorStateList(this, R.color.blue)
+        viewBinding.startProcessingButton.backgroundTintList = ContextCompat.getColorStateList(this, R.color.blue)
         viewBinding.processedFrameView.visibility = View.GONE
-        viewBinding.processedFrameView.setImageBitmap(null)
-        videoProcessor?.writeLedDistLogToFile()
-        openMapActivity()
+        viewBinding.processedFrameView.setImageDrawable(null)
     }
 
     private fun processFrameWithVideoProcessor() {
         val vp = videoProcessor ?: return
-        if (isProcessingFrame) return
+        if (isProcessingFrame || !activityResumed) return
         val bitmap = viewBinding.viewFinder.bitmap ?: return
+        val generation = frameGeneration
         isProcessingFrame = true
         vp.processFrame(bitmap) { processedFrames ->
-            runOnUiThread {
-                processedFrames?.let { (outputBitmap, _) ->
-                    if (isProcessing) {
-                        viewBinding.processedFrameView.setImageBitmap(outputBitmap)
-                    }
-                }
-                isProcessingFrame = false
+            if (generation != frameGeneration || !activityResumed) return@processFrame
+            processedFrames?.let { outputBitmap ->
+                if (isProcessing) viewBinding.processedFrameView.setImageBitmap(outputBitmap)
             }
+            isProcessingFrame = false
+            if (pendingMap) finishTracking()
         }
     }
 
@@ -408,35 +422,40 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun takeSnapshotAndProcessOnce() {
         val vp = videoProcessor ?: return
-        val btn = viewBinding.TakeSnapshotButton
-
-        viewBinding.processedFrameView.setImageDrawable(null)
-        viewBinding.processedFrameView.visibility = View.GONE
-        viewBinding.processedFrameView.invalidate()
-
-        btn.isEnabled = false
-        Toast.makeText(this, "Capturing snapshot…", Toast.LENGTH_SHORT).show()
-
-        val snapshot = viewBinding.viewFinder.bitmap
-        if (snapshot == null) {
-            btn.isEnabled = true
-            Toast.makeText(this, "No frame available yet.", Toast.LENGTH_SHORT).show()
+        if (isProcessing || isProcessingFrame || pendingMap) return
+        if (!allPermissionsGranted()) {
+            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
             return
         }
-
+        val snapshot = if (cameraHelper.cameraDevice != null) viewBinding.viewFinder.bitmap else null
+        if (snapshot == null) {
+            restartCamera()
+            Toast.makeText(this, "Waiting for the camera. Tap Snapshot again.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        vp.resetMeasurements()
+        val generation = frameGeneration
+        isProcessingFrame = true
+        viewBinding.TakeSnapshotButton.isEnabled = false
+        viewBinding.startProcessingButton.isEnabled = false
+        Toast.makeText(this, "Capturing snapshot…", Toast.LENGTH_SHORT).show()
         vp.processFrame(snapshot) { processed ->
-            processed?.let { (annotated, _) ->
-                viewBinding.processedFrameView.setImageBitmap(annotated)
-                viewBinding.processedFrameView.visibility = View.VISIBLE
+            if (generation != frameGeneration || !activityResumed) return@processFrame
+            isProcessingFrame = false
+            viewBinding.TakeSnapshotButton.isEnabled = true
+            viewBinding.startProcessingButton.isEnabled = true
+            if (processed == null) {
+                Toast.makeText(this, "Could not process this frame. Please retry.", Toast.LENGTH_LONG).show()
+                return@processFrame
             }
-
-            vp.writeLedDistLogToFile()
-
+            viewBinding.processedFrameView.setImageBitmap(processed)
+            viewBinding.processedFrameView.visibility = View.VISIBLE
+            if (vp.writeLedDistLogToFile() == null) {
+                Toast.makeText(this, "Could not save distances.", Toast.LENGTH_LONG).show()
+            }
             cameraHelper.closeCamera()
-            btn.isEnabled = true
         }
     }
 
@@ -479,67 +498,66 @@ class MainActivity : AppCompatActivity() {
         form.addView(led3Et)
         container.addView(form)
 
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Enter LED distances (cm)")
             .setView(container)
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Save") { _, _ ->
+            .setPositiveButton("Save", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val d1 = led1Et.text.toString().trim().toDoubleOrNull()
                 val d2 = led2Et.text.toString().trim().toDoubleOrNull()
                 val d3 = led3Et.text.toString().trim().toDoubleOrNull()
 
-                if (d1 == null || d2 == null || d3 == null) {
-                    Toast.makeText(this, "Please enter valid numbers for all three distances.", Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
+                if (listOf(d1, d2, d3).any { it == null || !it.isFinite() || it < LedLayout.sensorHeightCm }) {
+                    Toast.makeText(this, "Enter three distances of at least ${LedLayout.sensorHeightCm} cm (sensor height).", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
                 }
-
-                writeLedDistLogToFileFromInputs(d1, d2, d3)
-                openMapActivity()
+                if (writeLedDistLogToFileFromInputs(d1!!, d2!!, d3!!) != null) {
+                    dialog.dismiss()
+                    openMapActivity()
+                } else {
+                    Toast.makeText(this, "Could not save distances.", Toast.LENGTH_LONG).show()
+                }
             }
-            .show()
+        }
+        dialog.show()
     }
 
-    private fun writeLedDistLogToFileFromInputs(d1Cm: Double, d2Cm: Double, d3Cm: Double): File? {
-        fun fmtDistanceBraced(v: Double?): String =
-            if (v == null) "{N/A}" else "{${v.toInt()} CM}"
-
-        val name = "LiFind_Log.txt"
-        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-        if (!docsDir.exists()) docsDir.mkdirs()
-
-        val outFile = File(docsDir, name)
-        return try {
-            PrintWriter(BufferedWriter(FileWriter(outFile))).use { out ->
-                out.println("LED_1 -> Coordinates: {x=0, y=2} - Distance: ${fmtDistanceBraced(d1Cm)}")
-                out.println("LED_2 -> Coordinates: {x=2, y=-2} - Distance: ${fmtDistanceBraced(d2Cm)}")
-                out.println("LED_3 -> Coordinates: {x=-2, y=-2} - Distance: ${fmtDistanceBraced(d3Cm)}")
-            }
-            outFile
-        } catch (t: Throwable) {
-            Log.e("LedDistLogger", "Failed to write log", t)
-            null
-        }
+    private fun writeLedDistLogToFileFromInputs(d1Cm: Double, d2Cm: Double, d3Cm: Double): File? = try {
+        LedMeasurementStore.write(this, listOf(d1Cm, d2Cm, d3Cm))
+    } catch (error: Exception) {
+        Log.e("LedDistLogger", "Failed to write log", error)
+        null
     }
 
     override fun onResume() {
         super.onResume()
+        activityResumed = true
         cameraHelper.startBackgroundThread()
-        if (viewBinding.viewFinder.isAvailable) {
-            if (allPermissionsGranted()) {
-                cameraHelper.openCamera()
-            } else {
-                requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-            }
-        } else {
-            viewBinding.viewFinder.surfaceTextureListener = textureListener
+        if (allPermissionsGranted()) {
+            if (viewBinding.viewFinder.isAvailable) cameraHelper.openCamera()
+        } else if (!permissionRequested) {
+            permissionRequested = true
+            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
         }
     }
 
     override fun onPause() {
-        if (isRecording) stopProcessingAndRecording()
+        activityResumed = false
+        if (isRecording) videoProcessor?.writeLedDistLogToFile()
+        resetTracking()
         cameraHelper.closeCamera()
         cameraHelper.stopBackgroundThread()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        sharedPreferences.unregisterOnSharedPreferenceChangeListener(preferenceListener)
+        videoProcessor?.close()
+        videoProcessor = null
+        super.onDestroy()
     }
 
     private fun allPermissionsGranted(): Boolean = REQUIRED_PERMISSIONS.all {

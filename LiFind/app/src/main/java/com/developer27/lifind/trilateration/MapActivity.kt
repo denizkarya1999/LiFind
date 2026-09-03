@@ -1,6 +1,5 @@
 package com.developer27.lifind.trilateration
 
-import Trilateration
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -8,85 +7,27 @@ import android.graphics.Paint
 import android.graphics.PointF
 import android.graphics.RectF
 import android.os.Bundle
-import android.os.Environment
 import android.util.AttributeSet
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
-import org.opencv.core.Point
-import java.io.File
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
 class MapActivity : AppCompatActivity() {
-    private var LED_1: Point = Point(0.0, 43.18)
-    private var LED_2: Point = Point(43.18, 0.0)
-    private var LED_3: Point = Point(-43.18, 0.0)
-
-    private var LED_1_Distance: Double = 0.0
-    private var LED_2_Distance: Double = 0.0
-    private var LED_3_Distance: Double = 0.0
-
-    private var USER_POS: Pair<Double, Double> = 0.0 to 0.0
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val distances = LedMeasurementStore.read(this)
+        val position = if (distances.all { it != null }) {
+            runCatching {
+                Trilateration.solve(LedLayout.anchors, distances.filterNotNull(), LedLayout.sensorHeightCm)
+            }.getOrNull()
+        } else null
 
-        // 1) Parse and populate LED_1..3 and LED_1_Distance..3 from the log
-        readLatestLedAndDistancesFromLog()
-
-        // 2) World LED anchors (same as Python layout)
-        val ledCoords = listOf(
-            0.0 to 43.18,   // LED_1
-            43.18 to 0.0, // LED_2
-            -43.18 to 0.0   // LED_3
-        )
-        val distances = listOf(
-            LED_1_Distance,
-            LED_2_Distance,
-            LED_3_Distance
-        )
-
-        // 3) Trilaterate
-        USER_POS = Trilateration.solve(ledCoords, distances)
-
-        // 4) Show map; pass user position in *world* coords and footer info
-        val mapView = MapGridView(this).apply {
-            setUserPixelPosition(USER_POS.first, USER_POS.second) // world → compressed to 0..100 internally (with clamping at edges)
-            setFooterInfo(USER_POS, LED_1_Distance, LED_2_Distance, LED_3_Distance)
-        }
-        setContentView(mapView)
-    }
-
-    private fun readLatestLedAndDistancesFromLog() {
-        val docsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
-        val logFile = File(docsDir, "LiFind_Log.txt")
-        if (!logFile.exists()) return
-
-        val re = Regex(
-            """LED_(\d)\s*->\s*Coordinates:\s*\{x=([-\d]+),\s*y=([-\d]+)\}\s*-\s*Distance:\s*\{([^}]*)\}"""
-        )
-        fun parseDistance(token: String?): Double {
-            if (token == null) return 0.0
-            val m = Regex("""[-+]?\d+(?:\.\d+)?""").find(token)
-            return m?.value?.toDoubleOrNull() ?: 0.0
-        }
-
-        logFile.useLines { seq ->
-            seq.forEach { line ->
-                val m = re.find(line) ?: return@forEach
-                val idx = m.groupValues[1].toInt()
-                val x = m.groupValues[2].toDoubleOrNull() ?: 0.0
-                val y = m.groupValues[3].toDoubleOrNull() ?: 0.0
-                val distVal = parseDistance(m.groupValues[4])
-
-                when (idx) {
-                    1 -> { LED_1 = Point(x, y); LED_1_Distance = distVal }
-                    2 -> { LED_2 = Point(x, y); LED_2_Distance = distVal }
-                    3 -> { LED_3 = Point(x, y); LED_3_Distance = distVal }
-                }
-            }
-        }
+        setContentView(MapGridView(this).apply {
+            position?.let { setUserPixelPosition(it.first, it.second) }
+            setFooterInfo(position, distances[0], distances[1], distances[2])
+        })
     }
 }
 
@@ -96,7 +37,7 @@ class MapGridView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     // ---- World setup: 30×30 (−15..+15) ----
-    private val extentWorld = 30f
+    private val extentWorld = 300f
     private val halfExtent = extentWorld / 2f
 
     // ---- Compressed drawing space: 0..100 on both axes (without changing canvas size) ----
@@ -183,7 +124,7 @@ class MapGridView @JvmOverloads constructor(
     }
 
     /** Footer info: user position + distances for LED1..3 (kept in world units). */
-    fun setFooterInfo(userPos: Pair<Double, Double>, d1: Double, d2: Double, d3: Double) {
+    fun setFooterInfo(userPos: Pair<Double, Double>?, d1: Double?, d2: Double?, d3: Double?) {
         footerUser = userPos
         footerD1 = d1
         footerD2 = d2
@@ -244,7 +185,7 @@ class MapGridView @JvmOverloads constructor(
         val cx = w / 2f
         val cy = h / 2f
 
-        val stepWorld = 1f // 1-unit world grid
+        val stepWorld = 25f // centimetres
         var xw = -halfExtent
         while (xw <= halfExtent + 1e-3f) {
             val x = cx + xw * s
@@ -275,11 +216,7 @@ class MapGridView @JvmOverloads constructor(
         val radiusPx = 30f
 
         // Original world coordinates of LEDs
-        val ledWorld = listOf(
-            PointF( 0f,  2f), // LED_1
-            PointF(-2f, -2f), // LED_2
-            PointF( 2f, -2f)  // LED_3
-        )
+        val ledWorld = LedLayout.anchors.map { (x, y) -> PointF(x.toFloat(), y.toFloat()) }
         val labels = listOf("A", "B", "C")
 
         ledWorld.forEachIndexed { i, pW ->
@@ -341,7 +278,8 @@ class MapGridView @JvmOverloads constructor(
         val d3 = footerD3
 
         val lines = listOf(
-            "User Position: {x=${fmt(ux)}, y=${fmt(uy)}}",
+            if (footerUser == null) "Position unavailable: need 3 valid distances"
+            else "Position (cm): {x=${fmt(ux)}, y=${fmt(uy)}}",
             "LED A (1000): {${fmtD(d1)}}",
             "LED B (1001): {${fmtD(d2)}}",
             "LED C (1010): {${fmtD(d3)}}"
@@ -354,5 +292,5 @@ class MapGridView @JvmOverloads constructor(
     }
 
     private fun fmt(v: Double) = String.format(Locale.US, "%.4f", v)
-    private fun fmtD(v: Double?) = if (v == null || v.isNaN()) "N/A" else String.format(Locale.US, "%.4f", v)
+    private fun fmtD(v: Double?) = if (v == null || v.isNaN()) "N/A" else String.format(Locale.US, "%.2f cm", v)
 }
